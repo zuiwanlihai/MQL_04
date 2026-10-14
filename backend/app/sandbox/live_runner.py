@@ -17,6 +17,9 @@ stdin is an interpreter-level race on Windows).
 
 Exit codes mirror paper_runner: 0 = stopped, 2 = safety termination,
 3 = strategy load failure, 143 = parent died (stdin EOF beacon).
+
+main() 骨架在 :mod:`app.sandbox.runner_common`；Transport（order RPC +
+inbox 停泊）与 account 镜像分支是本文件独有、刻意不共享的部分。
 """
 
 from __future__ import annotations
@@ -31,22 +34,14 @@ for _var in (
 ):
     os.environ[_var] = "1"
 
-import argparse  # noqa: E402
 import json  # noqa: E402
-import pathlib  # noqa: E402
-import random  # noqa: E402
 import time  # noqa: E402
+from typing import cast  # noqa: E402
 
+from app.sandbox.incremental import IncrementalEngine  # noqa: E402
 from app.sandbox.live_engine import LiveEngine  # noqa: E402
-from app.sandbox.payload import load_payload  # noqa: E402
-from app.sandbox.runner_io import (  # noqa: E402
-    RunnerWriter,
-    start_wedge_reaper,
-)
-
-EXIT_DONE = 0
-EXIT_SAFETY = 2
-EXIT_LOAD_FAILED = 3
+from app.sandbox.runner_common import run_incremental_process  # noqa: E402
+from app.sandbox.runner_io import RunnerWriter  # noqa: E402
 
 # The child's wait for an order_result must exceed the parent's gateway order
 # timeout so the parent always answers first (UNKNOWN_ERROR only if it truly died).
@@ -141,71 +136,28 @@ class Transport:
                 return msg
 
 
-def _emit_all(tp: Transport, events) -> dict | None:
-    fail: dict | None = None
-    for ev in events:
-        if ev.kind == "fail":
-            fail = ev.data
-            tp.emit("fail", ev.data)
-        else:
-            tp.emit(ev.kind, ev.data)
-    return fail
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="app.sandbox.live_runner")
-    parser.add_argument("--payload", required=True, help="payload directory")
-    args = parser.parse_args(argv)
-
     tp = Transport()
-    # 心跳必须早于任何可能挂住的步骤启动，否则父进程会把启动耗时误判成卡死。
-    tp.start_heartbeat()
 
-    payload_dir = pathlib.Path(args.payload)
-    payload, bars = load_payload(payload_dir)
-    random.seed(payload.seed)
+    def _build(payload, bars, storage_path):
+        return LiveEngine(payload, bars, tp, storage_path=storage_path)
 
-    live = LiveEngine(payload, bars, tp, storage_path=payload_dir / "storage.json")
-    live.restore_storage()
-    start_wedge_reaper(tp.writer, live.eng.unresolved_timeout_seconds)
-
-    fail = _emit_all(tp, live.start())
-    if fail is not None:
-        return EXIT_LOAD_FAILED if fail.get("load_failed") else EXIT_SAFETY
-    tp.emit("started", {})  # parent-side gate: ticks may be delivered from now on
-
-    while True:
-        cmd = tp.next_command()
-        if cmd is None:
-            os._exit(143)  # stdin EOF — parent is gone
-        name = cmd.get("cmd")
-        if name == "bars":
-            if _emit_all(tp, live.feed(list(cmd.get("rows") or []))) is not None:
-                return EXIT_SAFETY
-        elif name == "ticks":
-            if _emit_all(tp, live.feed_ticks(list(cmd.get("rows") or []))) is not None:
-                return EXIT_SAFETY
-        elif name == "account":
+    def _extra(engine: IncrementalEngine, name: str, cmd: dict) -> bool:
+        if name == "account":
+            live = cast(LiveEngine, engine)
             live.apply_mirror(cmd.get("account") or {})
             tp.emit("account", live.account_event().data)
-        elif name == "status":
-            tp.emit("account", live.account_event().data)
-        elif name == "reset_anchor":
-            new = live.reset_anchor()
-            if new is None:
-                live.eng.emit_log("warn", "重置锚点失败：暂无可用报价")
-            else:
-                info = live.eng.symbol_info
-                digits = info.digits if info is not None else 5
-                live.eng.emit_log(
-                    "info", f"网格锚点已重置为当前价 {new:.{digits}f}"
-                )
-            _emit_all(tp, live.eng._drain())
-        elif name == "stop":
-            _emit_all(tp, live.stop(bool(cmd.get("close", True))))
-            tp.stop_heartbeat()
-            sys.stdout.flush()
-            return EXIT_DONE
+            return True
+        return False
+
+    return run_incremental_process(
+        prog="app.sandbox.live_runner",
+        build_engine=_build,
+        sink=tp,
+        read_command=tp.next_command,
+        extra_command=_extra,
+        argv=argv,
+    )
 
 
 if __name__ == "__main__":

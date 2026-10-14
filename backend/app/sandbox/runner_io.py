@@ -34,8 +34,11 @@ _MAX_LINE = 262_144
 # 熔断触发后留给「异步异常投递生效」的宽限；超时即认定救不回来。
 DEFAULT_WEDGE_GRACE_SECONDS = 10.0
 
-# 与 runner 退出码约定一致：2 = 安全终止（supervisor 归类为 TERM_FAILED）。
+# 与 runner 退出码约定一致：0 = 正常停止，2 = 安全终止（supervisor 归类为
+# TERM_FAILED），3 = 策略装载失败（143 = 父进程消失，调用点直接 os._exit）。
+EXIT_DONE = 0
 EXIT_SAFETY = 2
+EXIT_LOAD_FAILED = 3
 
 # 卡死时补发的失败事件：父进程需要一个明确的失败原因，否则只能报
 # 「沙箱进程异常退出」，运维看不出是回调卡死。
@@ -79,6 +82,12 @@ class RunnerWriter:
         with self._lock:
             sys.stdout.write(line[:_MAX_LINE] + "\n")
             sys.stdout.flush()
+
+    @property
+    def writer(self) -> RunnerWriter:
+        """EventSink 统一接口（Transport 提供同名 property）——wedge reaper
+        需要一个能直接 emit 的 writer，两种 sink 由此对齐。"""
+        return self
 
     # ── 心跳 ─────────────────────────────────────────────────────
     def start_heartbeat(self) -> None:
