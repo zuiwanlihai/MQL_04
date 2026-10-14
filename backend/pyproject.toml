@@ -17,8 +17,7 @@ dependencies = [
     "asyncpg>=0.29.0",
     "alembic>=1.13.1",
     "pydantic-settings>=2.1.0",
-    "redis>=5.0.1",
-    "celery>=5.3.6",
+    # Redis/Celery removed P2-3: zero consumers (pair_store uses in-memory dict)
     "python-jose[cryptography]>=3.3.0",
     "passlib[bcrypt]>=1.7.4",
     "argon2-cffi>=2.3.0",

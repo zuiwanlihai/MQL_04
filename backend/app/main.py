@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from app.api.v1.endpoints.market_ws import router as market_ws_router
 from app.api.v1.router import v1_router
 from app.config import settings
-from app.engine import close_db, close_redis, init_db, init_redis
+from app.engine import close_db, init_db
 from app.services.alert_rules import rules_loop
 from app.services.audit_patrol import patrol_loop
 from app.services.backtest.queue import get_backtest_queue
@@ -53,9 +53,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan — start-up and shut-down logic."""
     logger.info("Starting MT5 Quant Platform v%s", settings.APP_VERSION)
 
-    # Initialise infrastructure
+    # Initialise infrastructure (Redis/Celery removed P2-3, zero consumers)
     await init_db()
-    await init_redis()
 
     # Strategy template seed sync (sdk/templates → strategy_templates, by name).
     # Non-fatal: a sync failure must not block the platform from starting.
@@ -202,7 +201,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await shutdown_quote_hub()
         logger.info("Quote push hub stopped")
     logger.info("Shutting down …")
-    await close_redis()
     await close_db()
     logger.info("All connections closed")
 

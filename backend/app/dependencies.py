@@ -2,8 +2,11 @@
 FastAPI dependency callables.
 
 Every dependency is a thin wrapper around a resource manager (database session,
-Redis connection, JWT token verification) so that route handlers can request
-them with ``Depends(get_db)`` and friends.
+JWT token verification) so that route handlers can request them with
+``Depends(get_db)`` and friends.
+
+Redis infrastructure was removed in P2-3 (2026-10-14) — zero consumers,
+pair_store.py uses an in-memory dict for its short-lived pairing codes.
 """
 
 from __future__ import annotations
@@ -11,14 +14,12 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from typing import Annotated
 
-import redis.asyncio as aioredis
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.engine.redis import get_redis_client
 from app.engine.session import AsyncSessionLocal
 
 # ---------------------------------------------------------------------------
@@ -45,18 +46,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             yield session
         finally:
             await session.close()
-
-
-# ---------------------------------------------------------------------------
-# Redis
-# ---------------------------------------------------------------------------
-async def get_redis() -> aioredis.Redis:
-    """Return a connected async Redis client.
-
-    The client itself is obtained from a connection-pool factory; callers
-    **must not** close it as the pool manages lifecycle.
-    """
-    return await get_redis_client()
 
 
 # ---------------------------------------------------------------------------
@@ -113,4 +102,3 @@ async def get_current_user(
 # ---------------------------------------------------------------------------
 DBSession = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[dict, Depends(get_current_user)]
-RedisClient = Annotated[aioredis.Redis, Depends(get_redis)]

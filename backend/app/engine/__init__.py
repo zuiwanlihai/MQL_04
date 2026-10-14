@@ -1,14 +1,14 @@
-"""Engine package — database sessions, Redis pools, and related infrastructure."""
+"""Engine package — database sessions and related infrastructure.
 
-from app.engine.redis import close_redis, get_redis_client, init_redis
+Redis/Celery infrastructure was removed in P2-3 (2026-10-14):
+zero consumers across the app, pair_store.py uses in-memory dict.
+"""
+
 from app.engine.session import AsyncSessionLocal, close_db, get_engine, init_db
 
 __all__ = [
     "AsyncSessionLocal",
     "close_db",
-    "close_redis",
     "get_engine",
-    "get_redis_client",
     "init_db",
-    "init_redis",
 ]

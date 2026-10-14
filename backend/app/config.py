@@ -45,29 +45,6 @@ class Settings(BaseSettings):
     DATABASE_MAX_OVERFLOW: int = Field(default=10, ge=0)
     DATABASE_POOL_RECYCLE: int = Field(default=3600, ge=60)
 
-    # -- Redis ---------------------------------------------------------------
-    REDIS_URL: str = Field(
-        default="redis://localhost:6379/0",
-        description="Redis connection URL (used for caching, rate-limiting, sessions).",
-    )
-
-    REDIS_MAX_CONNECTIONS: int = Field(default=50, ge=1)
-
-    # -- Celery / Task Queue -------------------------------------------------
-    CELERY_BROKER_URL: str = Field(
-        default="redis://localhost:6379/1",
-        description="Celery broker URL (shared Redis instance, separate DB).",
-    )
-
-    CELERY_RESULT_BACKEND: str = Field(
-        default="redis://localhost:6379/2",
-        description="Celery result backend.",
-    )
-
-    CELERY_TASK_TRACK_STARTED: bool = True
-    CELERY_TASK_TIME_LIMIT: int = Field(default=600, ge=1)
-    CELERY_TASK_SOFT_TIME_LIMIT: int = Field(default=540, ge=1)
-
     # -- JWT / Authentication ------------------------------------------------
     JWT_SECRET_KEY: str = Field(
         default="CHANGE-ME-IN-PRODUCTION-USE-A-LONG-RANDOM-STRING",
