@@ -201,3 +201,70 @@ def test_force_close_all_end_of_run():
     assert len(out) == 2
     assert all(r.trade["comment"] == "end-of-run" for r in out)
     assert not acc.positions
+
+
+# ── P1-5 close volume_step validation ───────────────────────────
+
+def test_close_non_step_multiple_rejected():
+    """非 volume_step 倍数的平仓手数必须明确拒绝，不得静默截断。"""
+    acc = _account(volume_step=0.1)
+    f = Fill(price=1.10000, base_price=1.10000, spread_cost=0.0, slippage_cost=0.0)
+    res = acc.open_position("buy", f, 0.3, 1760000000, "")
+    pos_id = res.position_id
+    close_fill = Fill(1.10100, 1.10100, 0.0, 0.0)
+    # 0.07 is not a multiple of 0.1 → must reject
+    out = acc.close_position(pos_id, close_fill, 1760003600, volume=0.07)
+    assert not out.success
+    assert out.error_code == "INVALID_VOLUME"
+    assert "不是 volume_step" in (out.error_message or "")
+    # position still intact
+    assert pos_id in acc.positions
+
+
+def test_close_step_multiple_partial_allowed():
+    """volume_step 倍数的部分平仓正常执行。"""
+    acc = _account(volume_step=0.1)
+    f = Fill(price=1.10000, base_price=1.10000, spread_cost=0.0, slippage_cost=0.0)
+    res = acc.open_position("buy", f, 0.3, 1760000000, "")
+    pos_id = res.position_id
+    close_fill = Fill(1.10100, 1.10100, 0.0, 0.0)
+    out = acc.close_position(pos_id, close_fill, 1760003600, volume=0.2)
+    assert out.success
+    assert out.volume == pytest.approx(0.2)
+    # remaining 0.1 still open
+    assert acc.positions[pos_id].volume == pytest.approx(0.1)
+
+
+def test_close_volume_none_full_close_bypasses_step_check():
+    """volume=None 表示全平，使用持仓量（已保证是 step 倍数）。"""
+    acc = _account(volume_step=0.1)
+    f = Fill(price=1.10000, base_price=1.10000, spread_cost=0.0, slippage_cost=0.0)
+    res = acc.open_position("buy", f, 0.1, 1760000000, "")
+    close_fill = Fill(1.10100, 1.10100, 0.0, 0.0)
+    out = acc.close_position(res.position_id, close_fill, 1760003600)
+    assert out.success
+    assert not acc.positions
+
+
+# ── P1-3 commission only charged at close ──────────────────────
+# (engine.py layer tested in test_paper_engine; AccountSim balance
+# deduction verified by the existing round-trip test above.)
+
+def test_close_commission_pro_rata_on_partial_close():
+    """部分平仓的佣金按 close_vol 比例计算，不重复扣已平部分。"""
+    acc = _account(commission_per_lot=10.0)
+    f = Fill(price=1.10000, base_price=1.10000, spread_cost=0.0, slippage_cost=0.0)
+    res = acc.open_position("buy", f, 0.2, 1760000000, "")
+    pos_id = res.position_id
+    close_fill = Fill(1.10000, 1.10000, 0.0, 0.0)  # flat → pnl = 0
+    # partial close 0.1 → commission = 10 * 0.1 = 1.0
+    out1 = acc.close_position(pos_id, close_fill, 1760003600, volume=0.1)
+    assert out1.success and out1.trade is not None
+    assert out1.trade["commission"] == pytest.approx(1.0)
+    assert out1.trade["profit"] == pytest.approx(-1.0)  # pnl=0, minus commission
+    # full close remaining 0.1 → another 1.0 commission
+    out2 = acc.close_position(pos_id, close_fill, 1760007200)
+    assert out2.trade["commission"] == pytest.approx(1.0)
+    assert out2.trade["profit"] == pytest.approx(-1.0)
+    # total balance change = -2.0 (two commission charges, no price pnl)
+    assert acc.balance == pytest.approx(acc.initial_deposit - 2.0)

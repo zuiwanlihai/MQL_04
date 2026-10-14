@@ -399,12 +399,16 @@ class BacktestEngine:
         )
         assert opened.position_id is not None
         self._emit_signal(side, fill.price, vol, opened.position_id)
+        # commission_per_lot is charged at CLOSE time (AccountSim.close_position
+        # deducts from balance there); open never incurs a direct fee.  We
+        # intentionally report 0.0 here — a strategy should not infer its round-
+        # trip cost from the open OrderResult alone.
         order = OrderResult(
             success=True,
             order_id=opened.position_id,
             filled_volume=vol,
             filled_price=fill.price,
-            commission=self.account.commission_per_lot * vol,
+            commission=0.0,
         )
         self._call_on_order(order)
         return order

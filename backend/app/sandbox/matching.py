@@ -321,6 +321,19 @@ class AccountSim:
                 error_code=ErrorCode.INVALID_VOLUME,
                 error_message="平仓手数必须为正",
             )
+        # P1-5: 非 volume_step 倍数的平仓手数必须明确拒绝，不得静默截断。
+        # 开仓时 normalize_volume 会 floor 到 step（MT5 截断语义），但平仓
+        # 时策略传入非 step 倍数意味着逻辑错误，应该暴露。
+        if volume is not None and self.volume_step > 0:
+            ratio = close_vol / self.volume_step
+            if abs(round(ratio) - ratio) > 1e-6:
+                return MatchResult(
+                    success=False,
+                    error_code=ErrorCode.INVALID_VOLUME,
+                    error_message=(
+                        f"平仓手数 {close_vol} 不是 volume_step={self.volume_step} 的整数倍"
+                    ),
+                )
         if pos.direction == "buy":
             pnl = (fill.price - pos.open_price) * self.contract_size * close_vol
         else:

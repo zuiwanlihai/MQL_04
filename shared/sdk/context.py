@@ -112,7 +112,21 @@ class Position:
 
 @dataclass
 class OrderResult:
-    """Result of an order placement attempt."""
+    """Result of an order placement attempt.
+
+    Attributes:
+        success: True if the order was accepted and (for backtests) filled.
+        order_id: Position ticket for opens; order/position id for closes.
+        error_code: SDK ErrorCode if success is False.
+        error_message: Human-readable reason when success is False.
+        filled_volume: Actually filled volume (may differ from requested on
+            partial fills; always equals requested for this sandbox).
+        filled_price: Execution price after spread + slippage + model tier.
+        commission: **Only non-zero on close orders.**  ``commission_per_lot``
+            is charged once at close (round-trip) by ``AccountSim``; open order
+            results always return 0.0 here.  Do not use open.commission to
+            estimate total trade cost.
+    """
     success: bool
     order_id: Optional[str] = None
     error_code: Optional[ErrorCode] = None
