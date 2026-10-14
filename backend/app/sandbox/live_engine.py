@@ -184,7 +184,9 @@ class LiveEngine(IncrementalEngine):
                 side, order.filled_price or 0.0, order.filled_volume or 0.0,
                 order.order_id or "",
             )
-        self._call_on_order(order)
+        # 与 backtest/paper 的成交路径共用 engine 的同名回调入口（phase 置位/
+        # 恢复 + callback_timeout_seconds 一致），不另立副本。
+        self.eng._call_on_order(order)
         return order
 
     @staticmethod
@@ -199,18 +201,6 @@ class LiveEngine(IncrementalEngine):
             filled_price=res.get("filled_price"),
             commission=float(res.get("commission", 0.0) or 0.0),
         )
-
-    def _call_on_order(self, order: OrderResult) -> None:
-        eng = self.eng
-        prev = eng.phase
-        eng.phase = "on_order"
-        try:
-            eng._call(
-                "on_order", eng.ctx, order,
-                timeout=eng.payload.callback_timeout_seconds,
-            )
-        finally:
-            eng.phase = prev
 
     def apply_mirror(self, data: dict) -> None:
         self.mirror = {
