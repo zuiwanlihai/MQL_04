@@ -293,6 +293,57 @@ def on_order(ctx, order):
     assert any("INSUFFICIENT_MARGIN" in m for m in _log_messages(events))
 
 
+# ── P1-7 reject diagnostics ────────────────────────────────
+
+def test_rejected_order_emits_reject_event_and_report():
+    """P1-7: 保证金不足的拒单必须同时出现在 event stream 和 report 里。"""
+    src = """
+def on_init(ctx):
+    ctx.declare(symbol="EURUSD", period="H1")
+
+def on_bar(ctx, bar):
+    if ctx.storage.get("fired"):
+        return
+    ctx.storage["fired"] = True
+    r = ctx.buy("EURUSD", 50.0)
+    ctx.log.info(f"IM:{r.error_code}")
+
+def on_order(ctx, order):
+    pass
+"""
+    events = _run(src, initial_deposit=1000.0)
+
+    # 1. Event stream 里有 kind='reject' 的日志事件
+    reject_logs = [
+        e for e in _by_kind(events, "log")
+        if e.data.get("kind") == "reject"
+    ]
+    assert len(reject_logs) == 1
+    assert reject_logs[0].data["payload"]["error_code"] == "INSUFFICIENT_MARGIN"
+    assert "订单被拒 [INSUFFICIENT_MARGIN]" in reject_logs[0].data["message"]
+
+    # 2. Report 里 n_rejected > 0 且 rejections_by_code 有对应条目
+    done = _by_kind(events, "done")
+    assert len(done) == 1
+    report = done[0].data["report"]
+    assert report["n_rejected"] == 1
+    assert report["rejections_by_code"] == {"INSUFFICIENT_MARGIN": 1}
+
+
+def test_no_rejections_when_all_orders_succeed():
+    """P1-7: 正常完成的回测 report 里 n_rejected 应该是 0。"""
+    events = _run(BUY_ONCE, mode="standard")
+    done = _by_kind(events, "done")
+    assert len(done) == 1
+    report = done[0].data["report"]
+    assert report["n_rejected"] == 0
+    assert report["rejections_by_code"] == {}
+    # event stream 里也没有 reject kind
+    assert not any(
+        e.data.get("kind") == "reject" for e in _by_kind(events, "log")
+    )
+
+
 def test_end_of_run_forced_close_and_done_report():
     events = _run(BUY_ONCE, mode="standard")
     trades = _by_kind(events, "trade")

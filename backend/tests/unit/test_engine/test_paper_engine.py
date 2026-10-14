@@ -288,6 +288,61 @@ def test_feed_ticks_buy_fills_at_ask(tmp_path):
     assert not _by_kind(events, "fail")
 
 
+# ── P1-6 tick fill 确定性测试 ──────────────────────────────
+
+TICK_SELL_SRC = """
+def on_init(ctx):
+    ctx.declare(symbol="EURUSD", period="H1", params={})
+
+def on_tick(ctx, tick):
+    if ctx.storage.get("done"):
+        return
+    ctx.storage["done"] = True
+    r = ctx.sell("EURUSD", 0.1)
+    ctx.log.info(f"TSELL:{r.success}:{r.filled_price}")
+
+def on_bar(ctx, bar):
+    pass
+
+def on_order(ctx, order):
+    pass
+"""
+
+
+def test_feed_ticks_sell_fills_at_bid(tmp_path):
+    """P1-6: tick phase sell 必须按 tick bid（非 ask）成交，不付 spread。"""
+    payload = make_payload(TICK_SELL_SRC, mode="standard", warmup=0,
+                           slippage_points=0.0)
+    eng = PaperEngine(payload, make_bars(2), storage_path=tmp_path / "s.json")
+    list(eng.start())
+    events = list(eng.feed_ticks([TICKS[0]]))
+    msgs = _log_messages(events)
+    # tick: bid=1.1, ask=1.1002 → sell fills at bid = 1.1
+    assert any("TSELL:True:1.1" in m for m in msgs)
+    pos = _by_kind(events, "account")[-1].data["positions"][0]
+    assert pos["direction"] == "sell"
+    assert pos["open_price"] == pytest.approx(1.1)
+    assert not _by_kind(events, "fail")
+
+
+def test_feed_ticks_buy_adds_slippage(tmp_path):
+    """P1-6: tick phase buy 在 ask 基础上额外加 slippage。"""
+    # point 默认 0.00001；slippage=3pts → slip_p = 0.00003
+    # tick ask = 1.1002 → fill price = 1.1002 + 0.00003 = 1.10023
+    payload = make_payload(TICK_BUY_SRC, mode="standard", warmup=0,
+                           slippage_points=3.0)
+    eng = PaperEngine(payload, make_bars(2), storage_path=tmp_path / "s.json")
+    list(eng.start())
+    events = list(eng.feed_ticks([TICKS[0]]))
+    msgs = _log_messages(events)
+    assert any("QUOTE:1.1:1.1002" in m for m in msgs)
+    # buy: ask(1.1002) + slippage(3*0.00001) = 1.10023
+    assert any("TBUY:True:1.10023" in m for m in msgs)
+    pos = _by_kind(events, "account")[-1].data["positions"][0]
+    assert pos["open_price"] == pytest.approx(1.10023)
+    assert not _by_kind(events, "fail")
+
+
 def test_feed_ticks_without_on_tick_has_no_side_effect(tmp_path):
     payload = make_payload(BUY_ONCE, mode="standard", warmup=0)
     eng = PaperEngine(payload, make_bars(2), storage_path=tmp_path / "s.json")

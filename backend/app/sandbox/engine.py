@@ -255,6 +255,7 @@ class BacktestEngine:
         self._module: Optional[dict] = None
         self._call_depth = 0  # >0 ⇒ 当前是嵌套回调（on_order 在 on_bar 里）
         self._fuse = _CallbackFuse()
+        self._rejections: list[tuple[str, str]] = []  # (error_code, error_message) for report
 
     # ── event helpers (used by ctx + engine internals) ─────────
 
@@ -303,6 +304,23 @@ class BacktestEngine:
             "side": side, "price": price, "volume": volume,
             "position_id": pos_id, "bar_time": bar_time,
         })
+
+    def _record_rejection(self, error_code: ErrorCode | None, error_message: str | None) -> None:
+        """Emit a 'reject' log event + track for final report.
+
+        Every rejected order now leaves two traces:
+          1. A live event in the EngineEvent stream (kind='reject', level='warn')
+             so queue.py / the frontend can surface it immediately.
+          2. A counter in ``_rejections`` that ``_build_report()`` aggregates
+             as ``n_rejected`` + ``rejections_by_code`` — a post-run summary.
+        """
+        code = error_code.value if error_code is not None else "UNKNOWN_ERROR"
+        msg = error_message or ""
+        self._rejections.append((code, msg))
+        self.emit_log(
+            "warn", f"订单被拒 [{code}]：{msg}", kind="reject",
+            payload={"error_code": code, "error_message": msg},
+        )
 
     # ── account snapshots for ctx ──────────────────────────────
 
@@ -374,11 +392,13 @@ class BacktestEngine:
     def place_order(self, side: str, volume: float, comment: str) -> OrderResult:
         vol, err = self.account.normalize_volume(volume)
         if err is not None:
+            self._record_rejection(err.error_code, err.error_message)
             return OrderResult(
                 success=False, error_code=err.error_code, error_message=err.error_message
             )
         result = self._normal_fill(side)
         if not result.success or result.fill is None:
+            self._record_rejection(result.error_code, result.error_message)
             return OrderResult(
                 success=False, error_code=result.error_code, error_message=result.error_message
             )
@@ -386,13 +406,15 @@ class BacktestEngine:
         margin = self.account.margin_for(vol, fill.price)
         close = self._cur_close()
         if margin > self.account.free_margin(close):
+            msg = (
+                f"可用保证金不足：需要 {margin:.2f}，"
+                f"可用 {self.account.free_margin(close):.2f}"
+            )
+            self._record_rejection(ErrorCode.INSUFFICIENT_MARGIN, msg)
             return OrderResult(
                 success=False,
                 error_code=ErrorCode.INSUFFICIENT_MARGIN,
-                error_message=(
-                    f"可用保证金不足：需要 {margin:.2f}，"
-                    f"可用 {self.account.free_margin(close):.2f}"
-                ),
+                error_message=msg,
             )
         opened = self.account.open_position(
             side, fill, vol, int(self.bars.time[self.index]), comment
@@ -416,14 +438,17 @@ class BacktestEngine:
     def place_close(self, position_id: str, volume: Optional[float], comment: str) -> OrderResult:
         pos = self.account.positions.get(position_id)
         if pos is None:
+            msg = f"持仓 {position_id} 不存在"
+            self._record_rejection(ErrorCode.POSITION_NOT_FOUND, msg)
             return OrderResult(
                 success=False,
                 error_code=ErrorCode.POSITION_NOT_FOUND,
-                error_message=f"持仓 {position_id} 不存在",
+                error_message=msg,
             )
         close_side = "sell" if pos.direction == "buy" else "buy"
         result = self._normal_fill(close_side)
         if not result.success or result.fill is None:
+            self._record_rejection(result.error_code, result.error_message)
             return OrderResult(
                 success=False, error_code=result.error_code, error_message=result.error_message
             )
@@ -432,6 +457,7 @@ class BacktestEngine:
             volume=volume, comment=comment,
         )
         if not closed.success:
+            self._record_rejection(closed.error_code, closed.error_message)
             return OrderResult(
                 success=False, error_code=closed.error_code, error_message=closed.error_message
             )
@@ -828,6 +854,11 @@ class BacktestEngine:
                 "baseline": round(baseline_full[i], 4),
             })
 
+        # ── P1-7 reject diagnostics ─────────────────────────
+        rejections_by_code: dict[str, int] = {}
+        for code, _msg in self._rejections:
+            rejections_by_code[code] = rejections_by_code.get(code, 0) + 1
+
         report = {
             "total_return": total_return,
             "total_return_percent": total_return / deposit * 100.0 if deposit > 0 else 0.0,
@@ -846,6 +877,9 @@ class BacktestEngine:
             "total_swap": round(sum(t["swap"] for t in self.account.trades), 4),
             "n_bars": len(self.bars),
             "log_dropped": self._log_dropped,
+            # P1-7: every rejected order is now visible post-run
+            "n_rejected": len(self._rejections),
+            "rejections_by_code": rejections_by_code,
             **stats,
         }
         return report
