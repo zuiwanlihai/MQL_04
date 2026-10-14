@@ -111,6 +111,12 @@ def _new_process_client(monkeypatch) -> mc.MT5Client:
     # fake (different `account`, no `login`) and the lifespan misbehaves.
     sys.modules["MetaTrader5"] = _make_mt5_module()
 
+    # Initialize FAKE.terminal so the guard loop's first reachable check passes
+    # even before lifespan auto-login runs — otherwise the guard immediately
+    # sees reachable=False and launches a fake terminal (append to FAKE.launches)
+    # before try/finally has a chance to cancel it.
+    sys.modules["MetaTrader5"].initialize()
+
     fresh = mc.MT5Client()
     for name in _CLIENT_REFS:
         monkeypatch.setattr(importlib.import_module(name), "client", fresh)
