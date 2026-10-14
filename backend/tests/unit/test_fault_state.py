@@ -12,9 +12,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
-
-import pytest
+from datetime import datetime
 
 from app.services.fault_state import (
     FaultRecord,
@@ -24,7 +22,6 @@ from app.services.fault_state import (
     gate_fault,
     state_transition,
 )
-
 
 # ── FaultState 枚举 ─────────────────────────────────────────────
 

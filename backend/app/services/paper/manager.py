@@ -47,15 +47,15 @@ from app.services.backtest.supervisor import (
     TERM_STALLED,
     RunnerSupervisor,
 )
-from app.services.fault_state import (  # P0-4 统一故障状态机
-    FaultType,
-    gate_fault,
-)
 from app.services.ea_bridge import (
     registry as ea_registry,
 )
 from app.services.ea_bridge import (
     request_ea_rates,
+)
+from app.services.fault_state import (  # P0-4 统一故障状态机
+    FaultType,
+    gate_fault,
 )
 from app.services.gateway_client import (
     GatewayClient,

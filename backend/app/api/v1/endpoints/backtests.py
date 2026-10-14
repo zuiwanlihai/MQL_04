@@ -320,7 +320,8 @@ async def list_backtests(
     )
     items = list(result.scalars())
     return BacktestListResponse(
-        items=[BacktestTaskOut.model_validate(r) for r in items], total=total, page=page, page_size=page_size,
+        items=[BacktestTaskOut.model_validate(r) for r in items],
+        total=total, page=page, page_size=page_size,
         total_pages=max(math.ceil(total / page_size), 1),
     )
 

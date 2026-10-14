@@ -29,7 +29,8 @@ class AuditActor:
     """Who performed the action (from the request / system)."""
 
     actor_type: str = "user"      # user | system | strategy
-    actor_id: uuid.UUID | None = None  # was `object` — mypy can't pass to AuditLog.actor_id: Mapped[UUID | None]
+    # was `object` — mypy can't pass to AuditLog.actor_id: Mapped[UUID | None]
+    actor_id: uuid.UUID | None = None
     actor_label: str = ""
     source_ip: str = ""
 

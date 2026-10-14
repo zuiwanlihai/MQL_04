@@ -398,7 +398,9 @@ class AccountSim:
                 break
         return forced
 
-    def force_close_all(self, bar_time: int, close_fill_for: "Callable[..., Any]") -> list[MatchResult]:
+    def force_close_all(
+        self, bar_time: int, close_fill_for: "Callable[..., Any]"
+    ) -> list[MatchResult]:
         """End-of-run forced close at the final bar's close price."""
         out: list[MatchResult] = []
         for pos_id in sorted(self.positions, key=lambda k: int(k)):

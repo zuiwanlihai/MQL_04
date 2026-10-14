@@ -256,7 +256,8 @@ async def list_paper_runs(
     )
     items = list(result.scalars())
     return PaperListResponse(
-        items=[PaperRunOut.model_validate(r) for r in items], total=total, page=page, page_size=page_size,
+        items=[PaperRunOut.model_validate(r) for r in items],
+        total=total, page=page, page_size=page_size,
         total_pages=max(math.ceil(total / page_size), 1),
     )
 

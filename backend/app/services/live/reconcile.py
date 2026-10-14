@@ -33,8 +33,6 @@ from app.models import (
     RiskEvent,
 )
 from app.services.alert import emit as alert_emit
-from app.services.audit import AuditActor
-from app.services.audit import record as audit_record
 from app.services.fault_state import (  # P0-4 统一故障状态机
     FaultType,
     gate_fault,

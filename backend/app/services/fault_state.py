@@ -266,8 +266,8 @@ class FaultRecord:
         它本身绝不能因为 DB/网络故障级联杀死业务流。审计失败或告警
         失败只打 log，不抛异常。
         """
-        from app.services import audit as _audit  # noqa: WPS433
         from app.services import alert as _alert  # noqa: WPS433
+        from app.services import audit as _audit  # noqa: WPS433
 
         if db is not None:
             try:

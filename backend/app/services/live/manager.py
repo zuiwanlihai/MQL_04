@@ -47,11 +47,8 @@ from app.services.backtest.supervisor import (
     RunnerSupervisor,
 )
 from app.services.fault_state import (  # P0-4 统一故障状态机
-    FaultRecord,
-    FaultState,
     FaultType,
     gate_fault,
-    state_transition,
 )
 from app.services.gateway_client import (
     GatewayClient,
@@ -1151,7 +1148,8 @@ class LiveManager:
             "kind": "log", "level": "error",
             "message": (
                 f"K线-报价一致性校验失败(第{h.sanity_rejects}次)："
-                f"bar[{datetime.fromtimestamp(bar_time, tz=UTC).strftime('%H:%M')}] {low:.2f}~{high:.2f} "
+                f"bar[{datetime.fromtimestamp(bar_time, tz=UTC).strftime('%H:%M')}] "
+                f"{low:.2f}~{high:.2f} "
                 f"与最新报价 {bid:.2f} 脱离(容差±{tol:.2f})，"
                 f"已拒收本批 {len(fresh)} 根K线，不喂给策略引擎"
             ),

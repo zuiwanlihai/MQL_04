@@ -113,7 +113,8 @@ async def list_audit_logs(
         .offset((page - 1) * page_size).limit(page_size)
     )).scalars().all()
     return AuditListResponse(
-        items=[AuditOut.model_validate(r) for r in rows], total=total, page=page, page_size=page_size,
+        items=[AuditOut.model_validate(r) for r in rows],
+        total=total, page=page, page_size=page_size,
         total_pages=max((total + page_size - 1) // page_size, 1),
     )
 

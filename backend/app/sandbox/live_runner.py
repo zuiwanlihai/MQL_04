@@ -36,7 +36,6 @@ import json  # noqa: E402
 import pathlib  # noqa: E402
 import random  # noqa: E402
 import time  # noqa: E402
-from collections import deque  # noqa: E402
 
 from app.sandbox.live_engine import LiveEngine  # noqa: E402
 from app.sandbox.payload import load_payload  # noqa: E402
