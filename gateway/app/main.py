@@ -31,29 +31,44 @@ logger = logging.getLogger("gateway")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    # 第一件事就是验密钥：没配好的网关不该先连终端、再开始对外服务。
-    # 未配置时在这里抛 RuntimeError → uvicorn 报 "Application startup failed"
-    # 并以非零码退出，而不是留下一个无鉴权的交易端口。
-    security.assert_key_configured()
-
-    logger.info("MT5 gateway starting on %s:%s", settings.GATEWAY_HOST, settings.GATEWAY_PORT)
-
-    # -- abnormal-restart detection (state file from the previous run) --
-    ops.ABNORMAL_RESTART = ops.write_state_file()
-    if ops.ABNORMAL_RESTART is not None:
-        logger.error("previous gateway run did NOT exit cleanly (state file %s) — "
-                     "abnormal_restart flag raised for the backend alert",
-                     ops.ABNORMAL_RESTART)
-
-    # -- terminal guard loop (M11) --
-    guard = ops.TerminalGuard(client)
-    guard_task = asyncio.create_task(ops.guard_loop(guard), name="terminal-guard")
+    # 把**整个**启动-运行-清理包进 try/finally：
+    #   - security.assert_key_configured() 抛异常（如 API key 为空）
+    #     → guard_task 已经 create_task 了，必须 cancel
+    #   - MT5 auto-login 抛 MT5Error 被内部 try/except 吞掉，不影响
+    #   - yield 正常退出 → cleanup
+    #   - yield 之前的任意异常 → cleanup
+    guard_task: asyncio.Task | None = None
 
     try:
+        # 第一件事就是验密钥：没配好的网关不该先连终端、再开始对外服务。
+        # 未配置时在这里抛 RuntimeError → uvicorn 报 "Application startup failed"
+        # 并以非零码退出，而不是留下一个无鉴权的交易端口。
+        security.assert_key_configured()
+
+        logger.info(
+            "MT5 gateway starting on %s:%s",
+            settings.GATEWAY_HOST, settings.GATEWAY_PORT,
+        )
+
+        # -- abnormal-restart detection (state file from the previous run) --
+        ops.ABNORMAL_RESTART = ops.write_state_file()
+        if ops.ABNORMAL_RESTART is not None:
+            logger.error(
+                "previous gateway run did NOT exit cleanly (state file %s) — "
+                "abnormal_restart flag raised for the backend alert",
+                ops.ABNORMAL_RESTART,
+            )
+
+        # -- terminal guard loop (M11) --
+        guard = ops.TerminalGuard(client)
+        guard_task = asyncio.create_task(
+            ops.guard_loop(guard), name="terminal-guard",
+        )
+
         if settings.MT5_LOGIN and settings.MT5_PASSWORD and settings.MT5_SERVER:
             try:
                 summary = await client.login(
-                    settings.MT5_LOGIN, settings.MT5_PASSWORD, settings.MT5_SERVER
+                    settings.MT5_LOGIN, settings.MT5_PASSWORD, settings.MT5_SERVER,
                 )
                 logger.info(
                     "Auto-login OK: account %s @ %s",
@@ -61,18 +76,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 )
             except MT5Error as exc:
                 logger.warning("Auto-login failed: %s", exc.detail)
+
         yield
     finally:
-        # Cancel the guard loop BEFORE shutdown — shutdown clears the terminal
-        # handle, so any guard tick after that would see reachable=False and
-        # try to spawn a real terminal (which in CI/test environments asserts).
-        # try/finally guarantees cleanup even if lifespan raises *before* yield
-        # (e.g. assert_key_configured fails), leaving no orphan guard_task.
-        guard_task.cancel()
-        try:
-            await guard_task
-        except asyncio.CancelledError:
-            pass
+        # Guard loop MUST be cancelled whenever lifespan exits — even when
+        # it raises *before* yield (security.assert_key_configured 失败).
+        # An orphan guard_task would keep running probe_and_heal ticks and,
+        # on the next reachable=False, try subprocess.Popen to spawn a real
+        # MT5 terminal — which CI detects via the test's terminal guard.
+        if guard_task is not None:
+            guard_task.cancel()
+            try:
+                await guard_task
+            except asyncio.CancelledError:
+                pass
         try:
             await client.shutdown()
         finally:
