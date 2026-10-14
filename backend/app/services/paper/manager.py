@@ -67,6 +67,7 @@ from app.services.gateway_route import (
     resolve_gateway,
     resolve_node,
 )
+from app.services.run_base import BaseRunManager
 from app.services.strategy_validator import has_callback
 from app.services.tick_feed import fetch_ea_buffer_ticks, fetch_gateway_ticks
 
@@ -125,19 +126,7 @@ class _RunHandle:
     fail: Optional[dict] = None
 
 
-class PaperManager:
-    def __init__(self) -> None:
-        self._handles: dict[str, _RunHandle] = {}
-        self._start_tasks: set[asyncio.Task] = set()
-
-    def spawn_start(self, run_id: str) -> None:
-        """Fire-and-forget start with a strong task reference (GC guard)."""
-        task = asyncio.get_running_loop().create_task(self.start(run_id))
-        self._start_tasks.add(task)
-        task.add_done_callback(self._start_tasks.discard)
-
-    # ── lifecycle ──────────────────────────────────────────────
-
+class PaperManager(BaseRunManager):
     async def startup_sweep(self) -> None:
         """Mark rows orphaned by a backend restart as failed."""
         now = datetime.now(UTC)
@@ -169,8 +158,7 @@ class PaperManager:
         self._handles.clear()
         logger.info("paper manager stopped")
 
-    def active_count(self) -> int:
-        return len(self._handles)
+    # active_count() inherited from BaseRunManager
 
     # ── start / spawn ──────────────────────────────────────────
 
