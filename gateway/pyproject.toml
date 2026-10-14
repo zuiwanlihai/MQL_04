@@ -9,6 +9,8 @@ dependencies = [
     "pydantic-settings>=2.4",
     "psutil>=6.0",
     "MetaTrader5==5.0.6231",
+    "httpx>=0.28",
+    "pytest>=9",
 ]
 
 [build-system]
