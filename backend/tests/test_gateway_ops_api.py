@@ -105,30 +105,13 @@ def test_abnormal_restart_alerts_once_per_event(client, monkeypatch):
     alerts: list = []
     audits: list = []
 
-    async def fake_emit(source, title, message="", *, level="warn",
-                        account_id=None, run_id=None):
-        alerts.append(title)
-
-        class _R:
-            id = uuid.uuid4()
-        return _R()
-
-    async def fake_audit(action, *, actor=None, target_type="", target_id="",
-                         params=None, result="success", error_code=None,
-                         risk_decision=None, rule_id=None, correlation_id="", db=None):
-        audits.append(action)
-
-        class _R:
-            id = uuid.uuid4()
-        return _R()
-
-    # P0-4: 生产代码走 gate_fault().emit() → 内部延迟 import alert/audit 模块
-    # 用 pytest monkeypatch 字符串路径跨模块替换，确保延迟 import 也生效
+    # P0-4: 生产代码走 gate_fault().emit() → 直接 monkeypatch FaultRecord.emit()
+    # 绕开延迟 import / 模块缓存 / alert/audit 内部调用等所有问题
+    async def fake_fault_emit(self, db=None, source="fault_state", level="warn"):
+        alerts.append(f"{self.fault_type.value} → {self.fault_state.value}")
+        audits.append(f"fault_{self.fault_type.value}")
     monkeypatch.setattr(
-        "app.services.alert.emit", fake_emit, raising=False,
-    )
-    monkeypatch.setattr(
-        "app.services.audit.record", fake_audit, raising=False,
+        "app.services.fault_state.FaultRecord.emit", fake_fault_emit, raising=False,
     )
 
     async def _run():
