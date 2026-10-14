@@ -284,8 +284,14 @@ class FaultRecord:
                 source=source,
                 level=level,
                 title=f"{self.fault_type.value} → {self.fault_state.value}",
-                message=f"{self.action_taken}\n恢复建议：{self.recovery_suggestion}",
-                **self.to_alert(),
+                message=(
+                    f"{self.action_taken}\n"
+                    f"related={self.related_object}\n"
+                    f"恢复建议：{self.recovery_suggestion}"
+                    f"{chr(10) + self.detail if self.detail else ''}"
+                ),
+                run_id=self.related_object.get("run_id"),
+                account_id=self.related_object.get("account_id"),
             )
         except Exception:  # noqa: BLE001 — alert 失败不阻断
             logger.exception("fault alert emit failed: type=%s", self.fault_type.value)

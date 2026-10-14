@@ -34,6 +34,20 @@ from app.services.gateway_client import GatewayClient, GatewayError
 
 logger = logging.getLogger("mt5quant.gateway")
 
+
+# ---------------------------------------------------------------------------
+# Backward-compat shims (tests monkeypatch these; production uses FaultRecord.emit())
+# ---------------------------------------------------------------------------
+
+async def alert_emit(
+    source: str, title: str, message: str = "", *,
+    level: str = "warn", **_kw: object,
+) -> None:
+    """Legacy shim — forwards to alert.emit().  Do NOT use in new production code."""
+    from app.services import alert as _alert  # noqa: WPS433 — 延迟 import 避免顶层循环
+    await _alert.emit(source=source, title=title, message=message, level=level)
+
+
 # -- module-level heartbeat state (single loop per process) --------------------
 _failures: dict[str, int] = {}  # "host:port" → consecutive failed polls
 _next_cleanup_at = 0.0  # unix ts of the next retention sweep
