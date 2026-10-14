@@ -136,7 +136,7 @@ async def reconcile_once() -> dict[str, int]:
                     detail=f"diff_tickets={sorted(diff)} gateway={len(real_mine)} "
                            f"platform={len(mirrored_mine)}",
                     recovery_override="平台不会自动平仓，请人工核对 MT5 终端后在风控中心解冻。",
-                ).emit(db=db, level="critical")
+                ).emit(db=db, source="reconcile", level="critical")
                 logger.warning("reconcile mismatch account=%s diff=%s — frozen",
                                account_id, sorted(diff))
         finally:

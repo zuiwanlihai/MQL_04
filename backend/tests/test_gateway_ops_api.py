@@ -122,8 +122,12 @@ def test_abnormal_restart_alerts_once_per_event(client, monkeypatch):
             id = uuid.uuid4()
         return _R()
 
-    monkeypatch.setattr(hb, "alert_emit", fake_emit)
-    monkeypatch.setattr(hb, "audit_record", fake_audit)
+    # P0-4: 生产代码走 gate_fault().emit() → 内部延迟 import alert/audit 模块
+    # monkeypatch 模块本身的函数，确保延迟 import 也能拿到 mock
+    import app.services.alert as _alert_mod
+    import app.services.audit as _audit_mod
+    monkeypatch.setattr(_alert_mod, "emit", fake_emit)
+    monkeypatch.setattr(_audit_mod, "record", fake_audit)
 
     async def _run():
         from app.engine.session import AsyncSessionLocal

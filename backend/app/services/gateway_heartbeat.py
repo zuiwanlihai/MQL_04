@@ -116,7 +116,7 @@ async def _flag_abnormal_restart(node: GatewayNode, info: dict) -> None:
         action_taken="检测到网关异常重启，自动恢复",
         node_id=node.id,
         detail=detail,
-    ).emit()
+    ).emit(source="gateway_heartbeat", level="critical")
     logger.error("gateway %s:%s abnormal restart flagged (prev %s)",
                  node.host, node.port, last)
 
