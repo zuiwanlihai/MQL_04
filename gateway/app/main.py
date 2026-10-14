@@ -49,29 +49,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     guard = ops.TerminalGuard(client)
     guard_task = asyncio.create_task(ops.guard_loop(guard), name="terminal-guard")
 
-    if settings.MT5_LOGIN and settings.MT5_PASSWORD and settings.MT5_SERVER:
-        try:
-            summary = await client.login(
-                settings.MT5_LOGIN, settings.MT5_PASSWORD, settings.MT5_SERVER
-            )
-            logger.info("Auto-login OK: account %s @ %s", summary["login"], summary["server"])
-        except MT5Error as exc:
-            logger.warning("Auto-login failed: %s", exc.detail)
-    yield
-    guard_task.cancel()
     try:
-        await guard_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await client.shutdown()
+        if settings.MT5_LOGIN and settings.MT5_PASSWORD and settings.MT5_SERVER:
+            try:
+                summary = await client.login(
+                    settings.MT5_LOGIN, settings.MT5_PASSWORD, settings.MT5_SERVER
+                )
+                logger.info(
+                    "Auto-login OK: account %s @ %s",
+                    summary["login"], summary["server"],
+                )
+            except MT5Error as exc:
+                logger.warning("Auto-login failed: %s", exc.detail)
+        yield
     finally:
-        # Runs even if the release above is interrupted (CancelledError is a
-        # BaseException, so MT5Client.shutdown's own guard does not cover it).
-        # A state file left behind here would raise a spurious
-        # 「请先核对持仓」alert on the next boot.
-        ops.clear_state_file()  # clean exit → next boot is not "abnormal"
-    logger.info("MT5 gateway stopped")
+        # Cancel the guard loop BEFORE shutdown — shutdown clears the terminal
+        # handle, so any guard tick after that would see reachable=False and
+        # try to spawn a real terminal (which in CI/test environments asserts).
+        # try/finally guarantees cleanup even if lifespan raises *before* yield
+        # (e.g. assert_key_configured fails), leaving no orphan guard_task.
+        guard_task.cancel()
+        try:
+            await guard_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await client.shutdown()
+        finally:
+            # Runs even if the release above is interrupted (CancelledError is a
+            # BaseException, so MT5Client.shutdown's own guard does not cover it).
+            # A state file left behind here would raise a spurious
+            # 「请先核对持仓」alert on the next boot.
+            ops.clear_state_file()  # clean exit → next boot is not "abnormal"
+        logger.info("MT5 gateway stopped")
 
 
 def create_app() -> FastAPI:
