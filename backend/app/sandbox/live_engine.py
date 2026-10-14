@@ -17,31 +17,25 @@ Warm-up: ``warmup_end`` is pinned to the full startup history length, so every
 replayed bar is inside the warm-up window and orders are rejected with
 WARMUP_PERIOD — history never trades.  Newly fed live bars (index >= that
 length) are tradable.
+
+共享循环骨架（storage 三件套 / feed / feed_ticks / start / stop）在
+:mod:`app.sandbox.incremental`；本文件只保留 live 侧差异：RPC 传输调用、
+broker 镜像、warmup pin/unpin、账户事件载荷。
 """
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
-import numpy as np
 from sdk.context import AccountInfo, OrderResult, Position
 from sdk.errors import ErrorCode
 
-from app.sandbox import engine as engine_mod
 from app.sandbox.context import BacktestContext
 from app.sandbox.engine import BacktestEngine, EngineEvent
-from app.sandbox.import_hook import SandboxViolationError
-from app.sandbox.matching import TF_SECONDS
+from app.sandbox.incremental import IncrementalEngine, _iso
 from app.sandbox.payload import BacktestPayload, BarArrays
-
-STORAGE_FILE = "storage.json"
-
-
-def _iso(epoch_s: int) -> str:
-    return datetime.fromtimestamp(int(epoch_s), tz=UTC).isoformat()
 
 
 class LiveContext(BacktestContext):
@@ -123,7 +117,7 @@ class LiveContext(BacktestContext):
         return self._live.request_order("close", self._symbol, volume, position_id, comment)
 
 
-class LiveEngine:
+class LiveEngine(IncrementalEngine):
     """Incremental live loop; delegates the pure signal machinery to BacktestEngine."""
 
     def __init__(
@@ -133,15 +127,31 @@ class LiveEngine:
         transport,  # Transport from live_runner: request_order(...) + emit(...)
         storage_path: Optional[Path] = None,
     ) -> None:
-        self.payload = payload
-        self.eng = BacktestEngine(payload, bars)
-        self.ctx = LiveContext(self)
-        self.eng.ctx = self.ctx
+        super().__init__(payload, bars, storage_path)
         self.transport = transport
-        self.storage_path = storage_path
         self.mirror: dict = {"account": {}, "positions": []}
-        self.live = False
-        self._tf_seconds = TF_SECONDS[payload.timeframe]
+
+    # ── per-subclass hooks ─────────────────────────────────────
+
+    def _create_ctx(self) -> BacktestContext:
+        return LiveContext(self)
+
+    def _before_replay(self, eng: BacktestEngine) -> None:
+        # pin warmup_end to the whole startup history → replay never trades
+        eng.warmup_end = len(eng.bars)
+
+    def _after_replay(self, eng: BacktestEngine) -> None:
+        # Ticks don't advance the bar index — lift the pinned warmup so on_tick
+        # is tradable once the replay is over (new bars keep index > warmup_end;
+        # replayed history can never be re-processed because feed() skips
+        # stale/duplicate times).
+        if len(eng.bars):
+            eng.warmup_end = len(eng.bars) - 1
+
+    def _close_on_stop(self, eng: BacktestEngine) -> Iterator[EngineEvent]:
+        """close_positions 由父进程执行（真实平仓，RPC → 网关）——子进程只走
+        on_stop 与 storage 持久化，绝不在本地成交。"""
+        return iter(())
 
     # ── RPC ──────────────────────────────────────────────────────
     def request_order(
@@ -208,45 +218,6 @@ class LiveEngine:
             "positions": data.get("positions") or [],
         }
 
-    # ── storage persistence (recovery contract) ─────────────────
-    def restore_storage(self) -> None:
-        if self.storage_path is None or not self.storage_path.exists():
-            return
-        try:
-            data = json.loads(self.storage_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        if isinstance(data, dict):
-            self.eng.ctx._storage._data.update(data)
-
-    def _persist_storage(self) -> None:
-        if self.storage_path is None:
-            return
-        try:
-            self.storage_path.write_text(
-                json.dumps(self.eng.ctx._storage._data, ensure_ascii=False, default=str),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-
-    def set_storage(self, updates: dict) -> None:
-        """Parent-injected storage update; persists immediately so the
-        detail endpoint's ``strategy_state`` snapshot reflects it."""
-        self.eng.ctx._storage._data.update(updates)
-        self._persist_storage()
-
-    def reset_anchor(self) -> float | None:
-        """Re-anchor the grid template to the freshest quote (bid).
-
-        Returns the new anchor, or None when no quote is available yet."""
-        quote = self.eng.ctx.get_quote(self.eng.ctx.symbol)
-        if quote is None:
-            return None
-        bid = float(quote.bid)
-        self.set_storage({"anchor": bid})
-        return bid
-
     # ── account mirror event (from real broker snapshot) ────────
     def account_event(self) -> EngineEvent:
         a = self.mirror.get("account") or {}
@@ -263,114 +234,3 @@ class LiveEngine:
             ),
             "positions": list(self.mirror.get("positions") or []),
         })
-
-    # ── lifecycle ────────────────────────────────────────────────
-    def start(self) -> Iterator[EngineEvent]:
-        eng = self.eng
-        # pin warmup_end to the whole startup history → replay never trades
-        eng.warmup_end = len(eng.bars)
-        try:
-            eng._load_strategy()
-        except SandboxViolationError as exc:
-            yield EngineEvent("fail", {
-                "code": exc.code.value, "message": exc.message,
-                "traceback": "", "load_failed": True,
-            })
-            return
-        except Exception as exc:
-            yield EngineEvent("fail", {
-                "code": "RUNTIME_ERROR", "message": f"策略装载失败：{exc}",
-                "traceback": eng._tb(exc), "load_failed": True,
-            })
-            return
-
-        eng.phase = "on_init"
-        try:
-            eng._call("on_init", eng.ctx, timeout=eng.payload.on_init_timeout_seconds)
-        except SandboxViolationError as exc:
-            yield from eng._fail(exc.code.value, exc.message, exc)
-            return
-        except engine_mod.CallbackTimeoutError as exc:
-            yield from eng._fail("RESOURCE_TIMEOUT", str(exc), exc)
-            return
-        except Exception as exc:
-            yield from eng._fail("RUNTIME_ERROR", str(exc), exc)
-            return
-        if not eng.ctx._declared:
-            yield EngineEvent("fail", {
-                "code": "RUNTIME_ERROR",
-                "message": "策略必须在 on_init 中调用 ctx.declare()",
-                "traceback": "",
-            })
-            return
-        yield from eng._drain()
-
-        n = len(eng.bars)
-        for i in range(n):
-            eng.index = i
-            yield from eng._process_bar()
-            if eng._halted:
-                return
-            self._persist_storage()
-            yield self.account_event()
-            yield from eng._drain()
-        self.live = True
-        # Ticks don't advance the bar index — lift the pinned warmup so on_tick
-        # is tradable once the replay is over (new bars keep index > warmup_end;
-        # replayed history can never be re-processed because feed() skips
-        # stale/duplicate times).
-        if len(eng.bars):
-            eng.warmup_end = len(eng.bars) - 1
-
-    def feed(self, rows: list[list[float]]) -> Iterator[EngineEvent]:
-        eng = self.eng
-        if eng._halted or len(eng.bars) == 0:
-            return
-        for t, o, h, lo, c, v, sp, *rest in rows:
-            if int(t) <= int(eng.bars.time[-1]):
-                continue
-            eng.bars.time = np.append(eng.bars.time, int(t))
-            eng.bars.open = np.append(eng.bars.open, float(o))
-            eng.bars.high = np.append(eng.bars.high, float(h))
-            eng.bars.low = np.append(eng.bars.low, float(lo))
-            eng.bars.close = np.append(eng.bars.close, float(c))
-            eng.bars.tick_volume = np.append(eng.bars.tick_volume, int(v))
-            eng.bars.spread = np.append(eng.bars.spread, int(sp))
-            eng.index = len(eng.bars) - 1
-            yield from eng._process_bar()
-            if eng._halted:
-                return
-            self._persist_storage()
-            yield self.account_event()
-            yield from eng._drain()
-
-    def feed_ticks(self, rows: list[list[float]]) -> Iterator[EngineEvent]:
-        """Deliver real ticks (rows = [time_msc, bid, ask]) to on_tick.
-
-        Orders placed inside on_tick go through the same RPC transport as
-        on_bar (parent risk gate → gateway).  Batch-end persistence mirrors
-        the paper engine.
-        """
-        eng = self.eng
-        if eng._halted or len(eng.bars) == 0 or not rows:
-            return
-        yield from eng.feed_ticks(rows)
-        if eng._halted:
-            return
-        self._persist_storage()
-        yield self.account_event()
-        yield from eng._drain()
-
-    def stop(self, close_positions: bool) -> Iterator[EngineEvent]:
-        """Terminate. close_positions is executed by the PARENT (real closes),
-        not here — the child only calls on_stop and persists storage."""
-        eng = self.eng
-        try:
-            eng._call("on_stop", eng.ctx, "stopped",
-                      timeout=eng.payload.callback_timeout_seconds)
-        except Exception:
-            pass
-        eng.phase = "stop"
-        self._persist_storage()
-        yield self.account_event()
-        yield from eng._drain()
