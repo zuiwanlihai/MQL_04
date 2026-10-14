@@ -1,0 +1,180 @@
+# ============================
+# Docker Compose - Development Stack
+# MT5 Web Quantitative Trading Platform
+# ============================
+
+version: "3.9"
+
+services:
+  # ──────────── PostgreSQL 16 + TimescaleDB ────────────
+  postgres:
+    image: timescale/timescaledb:2.16.1-pg16
+    container_name: mt5_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mt5user
+      POSTGRES_PASSWORD: mt5password
+      POSTGRES_DB: mt5_quant
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mt5user -d mt5_quant"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - mt5_network
+    shm_size: "256mb"
+
+  # ──────────── Redis 7 ────────────
+  redis:
+    image: redis:7-alpine
+    container_name: mt5_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mt5_network
+
+  # ──────────── FastAPI Backend ────────────
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: mt5_backend
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mt5user:mt5password@postgres:5432/mt5_quant
+      DATABASE_URL_SYNC: postgresql://mt5user:mt5password@postgres:5432/mt5_quant
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-development}
+      JWT_ALGORITHM: HS256
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: 30
+      JWT_REFRESH_TOKEN_EXPIRE_DAYS: 7
+      CORS_ORIGINS: '["http://localhost:3000","http://localhost:5173"]'
+      ENVIRONMENT: development
+      LOG_LEVEL: DEBUG
+      MT5_SERVER: ${MT5_SERVER:-}
+      MT5_LOGIN: ${MT5_LOGIN:-}
+      MT5_PASSWORD: ${MT5_PASSWORD:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend:/app:delegated
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - mt5_network
+
+  # ──────────── Celery Worker ────────────
+  celery_worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: mt5_celery_worker
+    restart: unless-stopped
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4 --max-tasks-per-child=100
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mt5user:mt5password@postgres:5432/mt5_quant
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      ENVIRONMENT: development
+      LOG_LEVEL: DEBUG
+      MT5_SERVER: ${MT5_SERVER:-}
+      MT5_LOGIN: ${MT5_LOGIN:-}
+      MT5_PASSWORD: ${MT5_PASSWORD:-}
+    volumes:
+      - ../backend:/app:delegated
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mt5_network
+
+  # ──────────── Celery Beat Scheduler ────────────
+  celery_beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: mt5_celery_beat
+    restart: unless-stopped
+    command: celery -A app.tasks.celery_app beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mt5user:mt5password@postgres:5432/mt5_quant
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      ENVIRONMENT: development
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ../backend:/app:delegated
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mt5_network
+
+  # ──────────── Frontend (Nginx) ────────────
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    container_name: mt5_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - mt5_network
+
+# ──────────── Volumes ────────────
+volumes:
+  postgres_data:
+    name: mt5_postgres_data
+  redis_data:
+    name: mt5_redis_data
+
+# ──────────── Network ────────────
+networks:
+  mt5_network:
+    name: mt5_network
+    driver: bridge

@@ -1,0 +1,75 @@
+# ============================
+# Docker Compose - Dev Overrides
+#  docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up
+# ============================
+
+version: "3.9"
+
+services:
+  # ──────────── Backend hot-reload ────────────
+  backend:
+    environment:
+      LOG_LEVEL: DEBUG
+      ENVIRONMENT: development
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "1g"
+        reservations:
+          cpus: "0.5"
+          memory: "256m"
+
+  # ──────────── Celery Worker dev limits ────────────
+  celery_worker:
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "1g"
+        reservations:
+          cpus: "0.5"
+          memory: "256m"
+
+  # ──────────── Celery Beat dev limits ────────────
+  celery_beat:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256m"
+
+  # ──────────── Frontend Vite HMR ────────────
+  frontend:
+    build:
+      target: development
+    command: ["nginx", "-g", "daemon off;"]
+    volumes:
+      - ../frontend/dist:/usr/share/nginx/html:delegated
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "3000:80"
+      - "5173:5173"
+    environment:
+      - NODE_ENV=development
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "512m"
+
+  # ──────────── Postgres dev limits ────────────
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "1g"
+
+  # ──────────── Redis dev limits ────────────
+  redis:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256m"

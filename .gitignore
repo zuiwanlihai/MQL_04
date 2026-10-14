@@ -1,0 +1,119 @@
+# ============================
+# Git Ignore
+# MT5 Web Quantitative Trading Platform
+# ============================
+
+# ──────────── Python ────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+.venv/
+venv/
+env/
+.env
+.env.local
+.env.*.local
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+*.manifest
+# NOTE: *.spec is deliberately NOT ignored — gateway/MT5Gateway.spec and
+# gateway/MT5Pair.spec are hand-written PyInstaller build configs (source),
+# not generated artifacts.  Ignoring the extension silently untracked them.
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ──────────── Node / Frontend ────────────
+node_modules/
+dist/
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.eslintcache
+*.tsbuildinfo
+
+# ──────────── IDE ────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ──────────── OS ────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+Icon?
+
+# ──────────── Docker ────────────
+*.log
+docker-compose.override.yml
+
+# ──────────── Database ────────────
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+
+# ──────────── Project-specific ────────────
+# Local portable PostgreSQL installation (see auth vertical slice setup)
+.tools/
+
+# Per-run engine state (backtest/paper/live).  Every run mints a fresh UUID
+# directory of bars.npz / payload.json / storage.json / state.pkl files that
+# nothing ever reads again — tracking them makes `git status` permanently
+# dirty and buries real diffs in noise.
+.runtime/
+# Symbol metadata cache, rebuilt from the terminal on demand.
+.symbols.json
+# Compiled MQL5 binary (deploy/ea/EAQuantBridge.ex5).  Build artifact: the
+# .mq5 source next to it is the thing to track.
+*.ex5
+# Gateway installer bundle — produced by gateway/installer/build.ps1, which
+# stamps the version into the name.  Committing each release would add a
+# fresh 44 MB blob to history permanently.  Its sources (build.ps1, the two
+# *_entry.py, README.txt) and the .spec files ARE tracked.
+gateway/installer/*.zip
+*.key
+*.pem
+*.crt
+*.csr
+secrets/
+credentials/
+.mt5_*
+!docker/.env
+
+# ──────────── Terraform / IaC ────────────
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+# ──────────── Certificates ────────────
+*.jks
+*.p12
+*.pfx

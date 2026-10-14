@@ -1,0 +1,186 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-gray-700;
+  }
+
+  body {
+    @apply bg-surface-950 text-gray-100 font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* 下拉选项：暗色主题下 select 展开的原生列表在 Windows 上默认白底，
+     会继承浅色文字导致白底灰字看不清，这里强制暗底亮字 */
+  select option {
+    background-color: #1a1d24;
+    color: #e5e7eb;
+  }
+
+  /* Scrollbar styling for dark theme */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-surface-900;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-gray-600 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-gray-500;
+  }
+
+  /* Monaco editor overrides for dark theme */
+  .monaco-editor {
+    @apply rounded-md overflow-hidden;
+  }
+}
+
+@layer components {
+  /* Trading-specific utility classes */
+  .price-up {
+    @apply text-profit;
+  }
+
+  .price-down {
+    @apply text-loss;
+  }
+
+  .price-flat {
+    @apply text-gray-400;
+  }
+
+  /* Order side badges */
+  .badge-buy {
+    @apply bg-profit/20 text-profit border border-profit/30;
+  }
+
+  .badge-sell {
+    @apply bg-loss/20 text-loss border border-loss/30;
+  }
+
+  /* Status indicators */
+  .status-dot {
+    @apply inline-block w-2 h-2 rounded-full;
+  }
+
+  .status-dot-active {
+    @apply bg-profit animate-pulse;
+  }
+
+  .status-dot-warning {
+    @apply bg-yellow-500;
+  }
+
+  .status-dot-error {
+    @apply bg-loss;
+  }
+
+  .status-dot-inactive {
+    @apply bg-gray-600;
+  }
+
+  /* Card component */
+  .card {
+    @apply bg-surface-800 border border-gray-700/50 rounded-lg shadow-lg;
+  }
+
+  .card-header {
+    @apply flex items-center justify-between px-4 py-3 border-b border-gray-700/50;
+  }
+
+  .card-body {
+    @apply p-4;
+  }
+
+  /* Input field */
+  .input-dark {
+    @apply w-full bg-surface-900 border border-gray-700 rounded-md px-3 py-2
+           text-gray-100 placeholder-gray-500
+           focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-colors duration-150;
+  }
+
+  /* .input 别名：MT5下载弹窗、行情/优化等多个面板使用 className="input"，
+     此前该类未定义导致下拉框/输入框白底无法阅读 */
+  .input {
+    @apply w-full bg-surface-900 border border-gray-700 rounded-md px-3 py-2
+           text-gray-100 placeholder-gray-500
+           focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-colors duration-150;
+  }
+
+  /* Button variants */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-4 py-2
+           text-sm font-medium transition-colors duration-150
+           focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-surface-800
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply btn bg-blue-600 text-white hover:bg-blue-700 focus:ring-blue-500;
+  }
+
+  .btn-secondary {
+    @apply btn bg-surface-700 text-gray-200 hover:bg-surface-600 focus:ring-gray-500;
+  }
+
+  .btn-danger {
+    @apply btn bg-loss text-white hover:bg-loss-dark focus:ring-loss;
+  }
+
+  .btn-ghost {
+    @apply btn bg-transparent text-gray-400 hover:text-gray-200 hover:bg-surface-700;
+  }
+
+  .btn-success {
+    @apply btn bg-profit text-white hover:bg-profit-dark focus:ring-profit;
+  }
+
+  /* Table base */
+  .table-dark {
+    @apply w-full text-sm;
+  }
+
+  .table-dark thead {
+    @apply bg-surface-750 text-gray-400 text-xs uppercase tracking-wider;
+  }
+
+  .table-dark thead th {
+    @apply px-4 py-3 text-left font-medium;
+  }
+
+  .table-dark tbody tr {
+    @apply border-b border-gray-700/50 hover:bg-surface-750/50 transition-colors;
+  }
+
+  .table-dark tbody td {
+    @apply px-4 py-3;
+  }
+}
+
+@layer utilities {
+  /* Number tabular formatting */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Truncate text */
+  .truncate-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
