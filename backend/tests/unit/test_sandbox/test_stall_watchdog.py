@@ -159,6 +159,10 @@ def test_heartbeat_emits_only_heartbeat_events(monkeypatch):
     writer.start_heartbeat()
     time.sleep(0.3)
     writer.stop_heartbeat()
+    # stop_heartbeat 只是置位；最后一拍可能正卡在 _TearingStdout 的两半之间。
+    # 不 join 就直接读 chunks，会把「读得太早」误判成「行被撕开」。
+    if writer._thread is not None:
+        writer._thread.join(timeout=2.0)
 
     lines = [ln for ln in "".join(fake.chunks).splitlines() if ln]
     assert lines, "心跳线程一行都没打出来"
