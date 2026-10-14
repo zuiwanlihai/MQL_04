@@ -16,6 +16,9 @@ Concrete subclasses MUST override (not extracted — model/DB/behavior differ):
   - ``shutdown``       log message differs ("paper" vs "live")
   - ... all other trading methods
 
+Generic type parameter ``HandleT`` lets mypy infer the concrete ``_RunHandle``
+from each subclass without duplicating the ``__init__`` body.
+
 See also: ``services/paper/manager.py``, ``services/live/manager.py``.
 """
 
@@ -23,14 +26,16 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Generic, TypeVar
+
+HandleT = TypeVar("HandleT")
 
 
-class BaseRunManager(ABC):
+class BaseRunManager(ABC, Generic[HandleT]):
     """Infrastructure-only base.  Subclassed by PaperManager / LiveManager."""
 
     def __init__(self) -> None:
-        self._handles: dict[str, Any] = {}
+        self._handles: dict[str, HandleT] = {}
         self._start_tasks: set[asyncio.Task] = set()
 
     def spawn_start(self, run_id: str) -> None:

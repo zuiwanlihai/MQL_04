@@ -126,7 +126,7 @@ class _RunHandle:
     fail: Optional[dict] = None
 
 
-class PaperManager(BaseRunManager):
+class PaperManager(BaseRunManager[_RunHandle]):
     async def startup_sweep(self) -> None:
         """Mark rows orphaned by a backend restart as failed."""
         now = datetime.now(UTC)

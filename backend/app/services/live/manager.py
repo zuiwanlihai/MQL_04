@@ -163,7 +163,7 @@ class _RunHandle:
     halt_until: str = ""
 
 
-class LiveManager(BaseRunManager):
+class LiveManager(BaseRunManager[_RunHandle]):
     async def startup_sweep(self) -> None:
         """Mark rows orphaned by a backend restart as failed."""
         now = datetime.now(UTC)
