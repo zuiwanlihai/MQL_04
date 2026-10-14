@@ -12,7 +12,6 @@ Closed list per PRD M3:
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 
 def _nan_list(length: int) -> list[float]:
@@ -72,29 +71,37 @@ def macd(
     """
     MACD indicator.
 
+    MT5 口径（与前端镜像一致）：signal 是 MACD 线**有效段**上的 EMA —
+    种子取前 ``signal`` 个有效值的 SMA，之后 k = 2/(signal+1)。
+    不得对无效区补 0 后整体做 EMA（会污染种子）。
+
     Returns:
         (macd_line, signal_line, histogram)
         histogram = macd_line - signal_line
     """
+    n = len(data)
     ema_fast = ema(data, fast)
     ema_slow = ema(data, slow)
 
-    macd_line = _nan_list(len(data))
-    for i in range(len(data)):
+    macd_line = _nan_list(n)
+    for i in range(n):
         if not math.isnan(ema_fast[i]) and not math.isnan(ema_slow[i]):
             macd_line[i] = ema_fast[i] - ema_slow[i]
 
-    signal_line = ema([0.0 if math.isnan(v) else v for v in macd_line], signal)
-    # Fix: ema with NaN-aware start
-    valid_macd = [0.0 if math.isnan(v) else v for v in macd_line]
-    signal_line = ema(valid_macd, signal)
-    # Restore NaN for pre-signal period
-    first_valid = slow + signal - 2
-    for i in range(first_valid):
-        signal_line[i] = float("nan")
+    signal_line = _nan_list(n)
+    # 首个有效 macd 值下标；正常 fast < slow 时等于 slow - 1
+    start = next((i for i, v in enumerate(macd_line) if not math.isnan(v)), None)
+    if start is not None and signal > 0 and n >= start + signal:
+        dif = macd_line[start:]
+        k = 2.0 / (signal + 1)
+        prev = sum(dif[:signal]) / signal
+        signal_line[start + signal - 1] = prev
+        for i in range(signal, len(dif)):
+            prev = dif[i] * k + prev * (1 - k)
+            signal_line[start + i] = prev
 
-    histogram = _nan_list(len(data))
-    for i in range(len(data)):
+    histogram = _nan_list(n)
+    for i in range(n):
         if not math.isnan(macd_line[i]) and not math.isnan(signal_line[i]):
             histogram[i] = macd_line[i] - signal_line[i]
 
@@ -150,6 +157,9 @@ def kdj(
     """
     KDJ Stochastic indicator.
 
+    MT5 口径（与前端镜像一致）：首根（RSV 可算的第一根）即参与平滑，
+    K/D 从 50 起递推，J = 3K - 2D 同步从首根有值。
+
     Returns:
         (k_line, d_line, j_line)
     """
@@ -170,19 +180,16 @@ def kdj(
         else:
             rsv[i] = (close[i] - ll) / (hh - ll) * 100.0
 
-    # First K/D/J values use 50 as initial
+    # First K/D/J values: K/D seed at 50, then the first RSV is smoothed in
     start = period - 1
-    k_line[start] = 50.0
-    d_line[start] = 50.0
-
-    for i in range(start + 1, n):
-        if not math.isnan(rsv[i]):
-            k_line[i] = (k_period - 1) / k_period * k_line[i - 1] + rsv[i] / k_period
-            d_line[i] = (d_period - 1) / d_period * d_line[i - 1] + k_line[i] / d_period
-        else:
-            k_line[i] = k_line[i - 1]
-            d_line[i] = d_line[i - 1]
+    prev_k = 50.0
+    prev_d = 50.0
+    for i in range(start, n):
+        k_line[i] = (rsv[i] + (k_period - 1) * prev_k) / k_period
+        d_line[i] = (k_line[i] + (d_period - 1) * prev_d) / d_period
         j_line[i] = 3 * k_line[i] - 2 * d_line[i]
+        prev_k = k_line[i]
+        prev_d = d_line[i]
 
     return k_line, d_line, j_line
 

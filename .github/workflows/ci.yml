@@ -45,11 +45,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Ruff
-        run: ruff check app tests
+        run: ruff check app tests ../shared/tests
       - name: Mypy
         run: mypy app --show-error-codes
       - name: Pytest (includes live/paper reconcile regression)
         run: pytest tests -q
+      - name: Pytest (SDK indicators + mirror golden, P2-7)
+        run: pytest ../shared/tests -q
 
   gateway:
     name: Gateway (ruff + pytest)
@@ -91,5 +93,7 @@ jobs:
         run: npm ci
       - name: ESLint
         run: npm run lint
+      - name: Vitest (含 SDK 指标镜像对照 P2-7)
+        run: npm test -- --run
       - name: Build (tsc -b && vite build → zero type errors required)
         run: npm run build
