@@ -24,6 +24,11 @@ class RecordingStub:
         self.logins: list[tuple] = []
         RecordingStub.instances.append(self)
 
+    @classmethod
+    def for_registered_node(cls, base_url: str | None = None) -> RecordingStub:
+        # 桩只记 base_url，不区分凭据来源——本文件验的是路由，不是密钥范围。
+        return cls(base_url)
+
     async def login(self, login: int, password: str, server: str) -> dict:
         self.logins.append((login, password, server))
         return {

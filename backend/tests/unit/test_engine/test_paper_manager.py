@@ -77,6 +77,10 @@ def _install_fake_gateway(monkeypatch, mod) -> SimpleNamespace:
         def __init__(self, url=None) -> None:
             pass
 
+        @classmethod
+        def for_registered_node(cls, url=None):
+            return cls(url)
+
         async def ticks_range(self, symbol, start_s, end_s, limit=100_000):
             gw.calls.append((symbol, start_s, end_s, limit))
             if gw.error is not None:

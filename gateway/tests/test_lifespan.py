@@ -168,3 +168,20 @@ def test_crash_then_boot_still_reports_abnormal(gateway, monkeypatch):
     )
     body = _cycle(monkeypatch)
     assert body["abnormal_restart"] is True, "genuine crash must still be flagged"
+
+
+def test_blank_api_key_refuses_to_start(gateway, monkeypatch):
+    """2.5：密钥为空时应用拒绝启动——宁可不启动，也不开一个无鉴权的交易端口。
+
+    挡在前面的必须是密钥自检，不是别的启动错误：这里已经装好了假终端与状态
+    文件，lifespan 上再无别的可失败项。
+    """
+    _new_process_client(monkeypatch)
+    monkeypatch.setattr(main_mod.settings, "GATEWAY_API_KEY", "")
+
+    app = main_mod.create_app()
+    with pytest.raises(RuntimeError, match="GATEWAY_API_KEY"), TestClient(app):
+        pass  # 进入 lifespan 就该被拦住
+
+    # 空密钥下不得留下状态文件：那会让下一次启动误报「异常重启」。
+    assert not gateway.exists(), "被拒绝的启动不该污染状态文件"

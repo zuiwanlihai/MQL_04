@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from typing import cast
 
 from sqlalchemy import select
 
@@ -46,7 +47,9 @@ async def register_opened_position(
             ).scalar_one_or_none()
             if exists is None:
                 db.add(RiskPositionLog(
-                    account_id=uuid.UUID(account_id), ticket=int(ticket),
+                    # SQLAlchemy 类型注解把 UUID 列映射为 str；cast 绕过。
+                    account_id=cast(str, uuid.UUID(account_id)),
+                    ticket=int(ticket),
                     symbol=symbol[:32], open_time=int(open_time or time.time()),
                 ))
                 await db.commit()
@@ -78,7 +81,9 @@ async def sync_position_registry(
                 if ticket in known_map:
                     continue
                 new_rows.append(RiskPositionLog(
-                    account_id=acct, ticket=ticket,
+                    # SQLAlchemy 类型注解把 UUID 列映射为 str；cast 绕过。
+                    account_id=cast(str, acct),
+                    ticket=ticket,
                     symbol=str(p.get("symbol") or ""),
                     open_time=int(p.get("time") or 0),
                 ))
@@ -121,7 +126,7 @@ async def sync_position_registry(
                  "ticket": r.ticket, "symbol": r.symbol}
                 for r in rows if r.closed_at is not None
             ]
-            closed_trades.sort(key=lambda d: d["time"], reverse=True)
+            closed_trades.sort(key=lambda d: cast(int, d["time"]), reverse=True)
             open_times = [r.open_time for r in rows]
             if newly_closed:
                 logger.info("risk registry: acct=%s closed=%d total=%d",

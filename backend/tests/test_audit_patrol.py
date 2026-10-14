@@ -142,8 +142,8 @@ def test_patrol_intact_no_alert(client):
     _auth_client(client)  # register writes an audit row
     before = _count_rows(client, action="audit_patrol")
 
-    total, broken, fired = client.portal.call(ap.patrol_once)
-    assert broken == -1 and fired is False and total > 0
+    total, verdict, fired = client.portal.call(ap.patrol_once)
+    assert verdict == "ok" and fired is False and total > 0
     assert _count_rows(client, action="audit_patrol") == before + 1
     ap.reset_state()
 
@@ -160,8 +160,8 @@ def test_patrol_broken_alerts_once_then_recovers(client):
         tamper()
 
         # first patrol after tamper → critical alert fired
-        total, broken, fired = client.portal.call(ap.patrol_once)
-        assert broken >= 0 and fired is True
+        total, verdict, fired = client.portal.call(ap.patrol_once)
+        assert verdict == "critical" and fired is True
         assert _count_rows(client, source="alert_rule") == base_rule
         alerts = _chain_alerts(client)
         assert len(alerts) - base == 1 and alerts[-1]["level"] == "critical"
@@ -173,8 +173,8 @@ def test_patrol_broken_alerts_once_then_recovers(client):
 
         # repaired → recovery info alert
         restore()
-        _, broken3, fired3 = client.portal.call(ap.patrol_once)
-        assert broken3 == -1 and fired3 is True
+        _, verdict3, fired3 = client.portal.call(ap.patrol_once)
+        assert verdict3 == "ok" and fired3 is True
         alerts = _chain_alerts(client)
         assert len(alerts) - base == 2 and alerts[-1]["level"] == "info"
     finally:
@@ -192,3 +192,83 @@ def test_manual_verify_endpoint_still_works(client):
     body = r.json()
     assert body["ok"] is True and body["broken_index"] == -1
     ap.reset_state()
+
+
+def test_patrol_does_not_let_a_fork_mask_a_later_tamper(client):
+    """分叉之后再出现篡改，巡检必须照样发 critical。
+
+    旧巡检按「完好/断裂」两态记忆：库里一旦有过历史分叉（并发写入的旧病灶
+    就是），状态永远停在 broken——此后真有人改审计行，巡检只是又走了一遍
+    同一个状态，一条告警都不会再发。分叉就成了篡改的掩护。
+    """
+    ap.reset_state()
+    _auth_client(client)
+    tag = f"fp-{uuid.uuid4().hex[:8]}"
+
+    async def _run():
+        from sqlalchemy import func, select, update
+
+        from app.engine.session import AsyncSessionLocal
+        from app.models import AuditLog
+        from app.services.audit import _compute_hash, _payload_of, record, verify_chain
+
+        async with AsyncSessionLocal() as db:  # 记账点：之后写的行清理时全删
+            head_seq = int((await db.execute(
+                select(func.max(AuditLog.seq)))).scalar_one() or 0)
+        try:
+            # 垫场两行：分叉行的前驱不能是链首（空前驱是另一种异常：
+            # restart），否则这条用例的成败就取决于之前跑过多少用例。
+            for i in range(2):
+                await record("live_deploy", target_type="live_run",
+                             target_id=f"{tag}-seed{i}", params={"i": i})
+
+            # 一、造一处分叉：prev_hash 照抄链尾的前驱（内容完好）
+            async with AsyncSessionLocal() as db:
+                last = (await db.execute(
+                    select(AuditLog).order_by(AuditLog.seq.desc()).limit(1)
+                )).scalars().one()
+                fork = AuditLog(action="live_deploy", actor_label="fork-fixture",
+                                target_type="live_run", target_id=f"{tag}-fork",
+                                params={}, prev_hash=last.prev_hash)
+                fork.hash = _compute_hash(fork.prev_hash, _payload_of(fork))
+                db.add(fork)
+                await db.commit()
+
+            r1 = await ap.patrol_once()  # 只有分叉 → warn，且只响一次
+            r2 = await ap.patrol_once()
+
+            # 二、分叉之后照常写一行，再把它改掉
+            await record("live_deploy", target_type="live_run",
+                         target_id=f"{tag}-x", params={"x": 0})
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    update(AuditLog).where(AuditLog.target_id == f"{tag}-x")
+                    .values(params={"x": 999})
+                )
+                await db.commit()
+
+            r3 = await ap.patrol_once()  # 出现篡改 → 必须是 critical
+        finally:
+            # 清理：从链尾起删掉本次写的所有行（含巡检自己的 audit_patrol 行）
+            async with AsyncSessionLocal() as db:
+                rows = (await db.execute(
+                    select(AuditLog).where(AuditLog.seq > head_seq)
+                    .order_by(AuditLog.seq.desc())
+                )).scalars().all()
+                for r in rows:
+                    await db.delete(r)
+                await db.commit()
+            _, after = await verify_chain()
+        return r1, r2, r3, after
+
+    try:
+        (_, v1, fired1), (_, v2, fired2), (_, v3, fired3), after = (
+            client.portal.call(_run)
+        )
+    finally:
+        ap.reset_state()
+
+    assert v1 == "fork" and fired1 is True, "分叉要报，但口径是 fork"
+    assert v2 == "fork" and fired2 is False, "口径没变：不重复播报"
+    assert v3 == "critical" and fired3 is True, "分叉之后的篡改被吞掉了"
+    assert after == [], "清理后链应回到完好"

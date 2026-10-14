@@ -44,12 +44,18 @@ from app.services.risk.positions import register_opened_position, sync_position_
 logger = logging.getLogger("mt5quant.manual_trade")
 
 
-async def _recent_manual_order_count(account_id: str, window_sec: int = 60) -> int:
+async def _recent_manual_order_count(
+    account_id: str, window_sec: int = 60
+) -> int | None:
     """近 window_sec 秒内该账户成功手动下单数（审计日志为准，重启不丢）。
 
     max_orders_per_minute 规则在手动链路的数据源——引擎的
     orders_this_minute 由调用方传入，手动链路没有实盘任务的内存计数，
-    改从审计日志统计。失败返回 0（不阻断下单）。
+    改从审计日志统计。
+
+    查不到时返回 ``None`` 而**不是** 0：把失败折算成「这一分钟一单没有」，
+    等于让限频规则在数据库有状况时恰好失效——正是它最该生效的时候。调用方
+    （``_guard``）会把 ``None`` 原样交给 ``evaluate``，由它按拒绝处置。
     """
     try:
         async with AsyncSessionLocal() as db:
@@ -63,9 +69,9 @@ async def _recent_manual_order_count(account_id: str, window_sec: int = 60) -> i
                 )
             )
             return int(n.scalar_one() or 0)
-    except Exception:  # noqa: BLE001 — 统计失败不阻断下单
+    except Exception:  # noqa: BLE001 — 交给风控按 fail-closed 处置
         logger.exception("recent manual order count failed")
-        return 0
+        return None
 
 
 @dataclass
@@ -160,7 +166,7 @@ async def _open_client(db: AsyncSession, acct: MT5Account) -> GatewayClient:
             detail="绑定账户缺少可用凭据（密码密文缺失或解密失败），请重新绑定账户",
         )
     login, password, server = creds
-    client = GatewayClient(url)
+    client = GatewayClient.for_registered_node(url)
     try:
         await client.login(login, password, server)
     except (GatewayLoginError, GatewayError) as exc:
@@ -226,13 +232,22 @@ async def _guard(
                 recent_deals = await client.deals(end - 14 * 86400, end)
             except (GatewayError, GatewayLoginError):
                 recent_deals = None  # 历史拉取失败 → 冷却规则本次跳过，不阻断下单
+    # 只有限频规则消费这个计数，没有它就别白查一次审计表。查到 None 表示查询
+    # 失败——原样交给 evaluate，由它按 fail-closed 处置（见 _unavailable）。
+    orders_this_minute: int | None = 0
+    if op in ("buy", "sell") and any(
+        r.get("type") == "max_orders_per_minute"
+        and str(r.get("apply_to") or "both") in ("both", "manual")
+        for r in rules
+    ):
+        orders_this_minute = await _recent_manual_order_count(str(acct.id))
     verdict = evaluate(
         op=op, symbol=symbol, volume=volume, position_id=position_id,
         run=_run_view(acct), account=account, positions=positions, rules=rules,
         recent_deals=recent_deals,
         closed_trades=closed_trades,
         registry_open_times=registry_open_times,
-        orders_this_minute=await _recent_manual_order_count(str(acct.id)),
+        orders_this_minute=orders_this_minute,
         order_source="manual",
     )
     if not verdict.allow:

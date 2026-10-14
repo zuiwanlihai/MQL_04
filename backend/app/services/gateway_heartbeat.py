@@ -22,9 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.engine.session import AsyncSessionLocal
 from app.models import GatewayHealthLog, GatewayNode
-from app.services.alert import emit as alert_emit
 from app.services.audit import AuditActor
 from app.services.audit import record as audit_record
+from app.services.fault_state import (  # P0-4 统一故障状态机
+    FaultState,
+    FaultType,
+    gate_fault,
+    state_transition,
+)
 from app.services.gateway_client import GatewayClient, GatewayError
 
 logger = logging.getLogger("mt5quant.gateway")
@@ -82,43 +87,41 @@ async def _recent_error_rate(db: AsyncSession, node_id) -> float:
 
 
 async def _flag_abnormal_restart(node: GatewayNode, info: dict) -> None:
-    """PRD M1: 网关异常重启必须显著提示 + 触发告警（不得静默恢复）。"""
+    """PRD M1: 网关异常重启必须显著提示 + 触发告警（不得静默恢复）。
+
+    换成 FaultRecord.emit() 统一故障通道——内部自动走 alert + audit 双通道。
+    """
     last = info.get("started_at_iso") or "未知"
     pid = info.get("pid") or "?"
-    message = (
+    detail = (
         f"网关进程上次未正常退出（上次启动于 {last}，pid={pid}），已自动恢复。"
         "崩溃期间交易状态可能已变化——请先核对 MT5 持仓是否完整，再继续实盘。"
     )
-    await alert_emit(
-        source="gateway", level="critical",
-        title="网关异常重启：请先核对持仓",
-        message=message,
-    )
-    await audit_record(
-        "gateway_abnormal_restart",
-        actor=AuditActor(actor_type="system"),
-        target_type="gateway_node", target_id=str(node.id),
-        params={"last_started_at": last, "last_pid": pid,
-                "host": node.host, "port": node.port},
-    )
+    await gate_fault(
+        fault_type=FaultType.GATEWAY_DISCONNECTED,
+        action_taken="检测到网关异常重启，自动恢复",
+        node_id=node.id,
+        detail=detail,
+    ).emit()
     logger.error("gateway %s:%s abnormal restart flagged (prev %s)",
                  node.host, node.port, last)
 
 
 async def _flag_guard_giveup(node: GatewayNode) -> None:
-    """Terminal guard exceeded its restart cap → alert once (PRD 防无限抖动)."""
-    await alert_emit(
-        source="gateway", level="critical",
-        title="MT5 终端守护已放弃自动拉起",
-        message="10 分钟内终端拉起失败已达上限，网关停止自动重试。"
-                "请人工启动 MT5 终端并确认登录状态（实盘持仓当前无平台风控保护）。",
+    """Terminal guard exceeded its restart cap → alert once (PRD 防无限抖动).
+
+    换成 FaultRecord.emit() 统一故障通道——内部自动走 alert + audit 双通道。
+    """
+    detail = (
+        "10 分钟内终端拉起失败已达上限，网关停止自动重试。"
+        "请人工启动 MT5 终端并确认登录状态（实盘持仓当前无平台风控保护）。"
     )
-    await audit_record(
-        "gateway_guard_giveup",
-        actor=AuditActor(actor_type="system"),
-        target_type="gateway_node", target_id=str(node.id),
-        params={"host": node.host, "port": node.port},
-    )
+    await gate_fault(
+        fault_type=FaultType.GATEWAY_GIVEUP,
+        action_taken="终端守护已放弃自动拉起，停止重试",
+        node_id=node.id,
+        detail=detail,
+    ).emit()
     logger.error("gateway %s:%s terminal guard gave up", node.host, node.port)
 
 
@@ -127,7 +130,7 @@ async def _probe_node(db: AsyncSession, node: GatewayNode) -> None:
     key = f"{node.host}:{node.port}"
     prev_status = node.status
 
-    client = GatewayClient(f"http://{node.host}:{node.port}")
+    client = GatewayClient.for_registered_node(f"http://{node.host}:{node.port}")
     started = perf_counter()
     health: dict | None = None
     error_message: str | None = None
@@ -143,6 +146,22 @@ async def _probe_node(db: AsyncSession, node: GatewayNode) -> None:
         _failures[key] = 0
         new_status = classify(health)
         node.status = new_status
+        # P0-4 恢复事件：从 degraded/offline 滑回 online → 记录状态转换
+        if new_status == "online" and prev_status in ("offline", "degraded"):
+            transition = state_transition(
+                from_state=FaultState.FAILED if prev_status == "offline" else FaultState.DEGRADED,
+                to_state=FaultState.RUNNING,
+                reason=f"网关心跳恢复正常（前态 {prev_status}）",
+                related_object={"node_id": str(node.id), "host": node.host, "port": node.port},
+            )
+            logger.info(transition.to_log())
+            # 恢复事件走 audit 但不走 alert（不是紧急事件）
+            await audit_record(
+                "gateway_recovered",
+                actor=AuditActor(actor_type="system"),
+                target_type="gateway_node", target_id=str(node.id),
+                params={"prev_status": prev_status, **transition.related_object},
+            )
         node.last_heartbeat = datetime.now(timezone.utc)
         node.version = str(health.get("version") or "")
         node.uptime_seconds = float(health.get("uptime_seconds") or 0)
@@ -173,7 +192,7 @@ async def _probe_node(db: AsyncSession, node: GatewayNode) -> None:
         # Terminal guard gave up (restart cap hit) → alert once until recovered.
         if health.get("guard_gave_up"):
             if not metadata.get("guard_gave_up_alerted"):
-                metadata["guard_gave_up_alerted"] = True
+                metadata["guard_gave_up_alerted"] = "1"
                 node.metadata_json = metadata
                 await _flag_guard_giveup(node)
         elif metadata.get("guard_gave_up_alerted"):
@@ -187,6 +206,22 @@ async def _probe_node(db: AsyncSession, node: GatewayNode) -> None:
         )
         new_status = "offline" if _failures[key] >= threshold else "degraded"
         node.status = new_status
+        # P0-4 关键观测缺口：网关从 degraded 滑入 offline 零输出——现在补结构化故障
+        if new_status == "offline" and prev_status != "offline":
+            await gate_fault(
+                fault_type=FaultType.GATEWAY_DISCONNECTED,
+                action_taken="连续心跳失败达到阈值，判定网关离线",
+                node_id=node.id,
+                detail=f"{node.host}:{node.port} 连续 {_failures[key]} 次心跳失败",
+            ).emit(db=db)
+        elif new_status == "degraded" and prev_status == "online":
+            # 从 online 首次滑入 degraded：加 warn 级故障（不走 critical）
+            await gate_fault(
+                fault_type=FaultType.GATEWAY_DISCONNECTED,
+                action_taken="心跳失败，网关降级",
+                node_id=node.id,
+                detail=f"{node.host}:{node.port} 心跳失败（{_failures[key]} 次）",
+            ).emit(db=db, level="warn")
 
     # -- sampled logging: status change always, otherwise ≥ interval ----------
     now = datetime.now(timezone.utc)
@@ -254,6 +289,44 @@ async def heartbeat_loop() -> None:
                 await heartbeat_once(db)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — never let the loop die
+        except Exception as exc:  # noqa: BLE001 — never let the loop die
+            # P0-4 区分 DB 错误 vs 其他异常：DB 挂了要结构化告警，
+            # 不能让心跳循环静默吞掉
+            _emit_db_unavailable_if_any(exc, source="heartbeat_loop")
             logger.exception("gateway heartbeat iteration failed")
         await asyncio.sleep(settings.GATEWAY_HEARTBEAT_INTERVAL)
+
+
+def _emit_db_unavailable_if_any(exc: Exception, source: str = "") -> None:
+    """后台循环统一的 DB 错误判定 + 结构化 emit（容错，绝不抛）。
+
+    与 reconcile.py 的 _is_db_error 逻辑一致，但用同步 try/except——
+    心跳循环上下文方便直接调用。
+    """
+    import asyncio
+
+    name = type(exc).__name__
+    module = type(exc).__module__ or ""
+    is_db = (
+        "sqlalchemy" in module and name in (
+            "OperationalError", "InterfaceError", "DBAPIError",
+            "InternalError", "ProgrammingError",
+        )
+        or ("asyncpg" in module or "psycopg" in module)
+        or isinstance(exc, (ConnectionRefusedError, ConnectionError))
+    )
+    if not is_db:
+        return
+
+    try:
+        # 在当前事件循环里 fire-and-forget emit，不阻塞循环
+        async def _fire():
+            await gate_fault(
+                fault_type=FaultType.DB_UNAVAILABLE,
+                action_taken=f"{source} 遇 DB 错误：{exc}",
+                detail=f"{source} exception: {name}: {exc}",
+            ).emit(db=None, level="critical")
+        loop = asyncio.get_event_loop()
+        loop.create_task(_fire())
+    except Exception:  # noqa: BLE001 — emit 自身不能杀循环
+        logger.exception("DB_UNAVAILABLE emit failed from %s", source)

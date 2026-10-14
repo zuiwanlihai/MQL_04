@@ -130,6 +130,8 @@ class PaperTradeOut(BaseModel):
     slippage_cost: float
     comment: str
     is_forced: bool
+    # 产生于被熔断打断的回调内：这笔成交本身可疑，别拿它当可信样本。
+    suspect: bool = False
 
 
 class TradeListResponse(BaseModel):

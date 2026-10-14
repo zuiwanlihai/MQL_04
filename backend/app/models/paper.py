@@ -263,6 +263,13 @@ class PaperTrade(BaseModel, kw_only=True):
         nullable=False, default=False,
         comment="True when closed by stop-out or user stop-with-close.",
     )
+    suspect: Mapped[bool] = mapped_column(
+        nullable=False, default=False,
+        comment=(
+            "成交产生于被回调超时熔断打断的那次回调内——回调已被判失败，"
+            "这笔只是模拟账本上的既成事实，统计/复盘时不应与正常成交等同看待。"
+        ),
+    )
 
     def __repr__(self) -> str:
         return f"<PaperTrade run_id={self.run_id!r} ticket={self.ticket!r} profit={self.profit!r}>"

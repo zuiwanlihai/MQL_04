@@ -94,6 +94,8 @@ async def backfill(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GatewayError as exc:
         _fail(exc)
+    # 审计行不挂在请求会话上：此处状态早已提交，传 db=db 的话没人再 commit，
+    # 这行会随请求会话一起被回滚掉——审计静默丢失，事后查不到任何人做过什么。
     await audit.record(
         "market_history.backfill",
         actor=_actor(current),
@@ -106,7 +108,6 @@ async def backfill(
             "complete": out["complete"],
             "attempts": out["attempts"],
         },
-        db=db,
     )
     return HistoryBackfillResponse(**out)
 
@@ -136,12 +137,13 @@ async def remove_coverage(
     removed = await mh.remove_tracking(db, symbol, timeframe)
     if not removed:
         raise HTTPException(status_code=404, detail="未找到该追踪记录")
+    # 审计行不挂在请求会话上：此处状态早已提交，传 db=db 的话没人再 commit，
+    # 这行会随请求会话一起被回滚掉——审计静默丢失，事后查不到任何人做过什么。
     await audit.record(
         "market_history.untrack",
         actor=_actor(current),
         target_type="symbol",
         target_id=symbol,
         params={"timeframe": timeframe},
-        db=db,
     )
     return HistoryRemoveResponse(symbol=symbol, timeframe=timeframe, removed=True)

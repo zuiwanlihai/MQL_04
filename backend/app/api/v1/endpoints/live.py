@@ -45,12 +45,15 @@ from app.schemas.live import (
     LiveCreate,
     LiveListResponse,
     LiveLogListResponse,
+    LiveLogOut,
     LiveRunDetailOut,
     LiveRunOut,
     LiveStopRequest,
     LiveTradeListResponse,
+    LiveTradeOut,
     ReAdmitRequest,
     RiskEventListResponse,
+    RiskEventOut,
     RiskRuleCreate,
     RiskRuleOut,
     RiskRuleUpdate,
@@ -208,6 +211,86 @@ async def _require_role(db: AsyncSession, current: dict, roles: tuple[str, ...])
     return user
 
 
+async def _is_admin(db: AsyncSession, current: dict) -> bool:
+    user = await db.get(User, _user_id(current))
+    return bool(user is not None and (user.role == "admin" or user.is_superuser))
+
+
+# ── 归属（对象级授权，2.7）─────────────────────────────────────
+#
+# 角色只回答「能不能做这类事」，回答不了「能不能动**这一个**」。风控规则、
+# 告警已读、白名单此前都只验角色，于是一个 trader 能改、能删别人账户上的
+# 风控规则——绕过风控不只是把自己那套调松，还可以去动别人的。
+#
+# 归属判定沿用仓内既有约定（`manual_trade._owned_account`）：`user_id is None`
+# 的账户视为共享，人人可用；越权一律 **404 而非 403**——403 等于告诉对方
+# 「这个 id 真实存在，只是不是你的」。
+
+def _my_account_ids(current: dict):
+    uid = _user_id(current)
+    return select(MT5Account.id).where(
+        (MT5Account.user_id == uid) | MT5Account.user_id.is_(None)
+    )
+
+
+def _my_run_ids(current: dict):
+    return select(LiveRun.id).where(LiveRun.user_id == _user_id(current))
+
+
+def _rule_visible(current: dict):
+    """我能看见的规则：自己的 + 全局的。
+
+    全局规则必须对所有人可见——它在拦所有人的单，藏起来就成了「下单被拒但
+    查不到为什么」。可见 ≠ 可改：改全局规则要管理员（见 ``_owned_rule``）。
+    """
+    return (
+        (RiskRule.scope == "global")
+        | RiskRule.account_id.in_(_my_account_ids(current))
+        | RiskRule.run_id.in_(_my_run_ids(current))
+    )
+
+
+def _alert_markable(current: dict):
+    """我能标已读的告警：自己账户/运行上的。
+
+    平台级告警（无账户、无运行，例如「网关异常重启，请核对持仓」）不在此列：
+    ``is_read`` 是**共享**标记，谁标了就是替全体标了——那条提醒本来就是说给
+    运维听的，不该由普通用户替所有人清掉。
+    """
+    return (
+        AlertEvent.account_id.in_(_my_account_ids(current))
+        | AlertEvent.run_id.in_(_my_run_ids(current))
+    )
+
+
+async def _owned_rule(
+    db: AsyncSession, rule_id: uuid.UUID, current: dict
+) -> RiskRule:
+    """取一条我管得着的规则：自己的账户/运行上的，或管理员手里的任意一条。
+
+    全局规则（对所有人生效）只有管理员能动。
+    """
+    rule = await db.get(RiskRule, rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail="规则不存在")
+    if await _is_admin(db, current):
+        return rule
+    if rule.scope == "global":
+        raise HTTPException(status_code=404, detail="规则不存在")
+    owned = False
+    if rule.account_id is not None:
+        acct = await db.get(MT5Account, rule.account_id)
+        owned = acct is not None and (
+            acct.user_id is None or str(acct.user_id) == current["sub"]
+        )
+    if not owned and rule.run_id is not None:
+        run = await db.get(LiveRun, rule.run_id)
+        owned = run is not None and str(run.user_id) == current["sub"]
+    if not owned:
+        raise HTTPException(status_code=404, detail="规则不存在")
+    return rule
+
+
 # ---------------------------------------------------------------------------
 # Wizard step 3: admission check (GET-style POST, read-only)
 # ---------------------------------------------------------------------------
@@ -226,10 +309,8 @@ async def check_admission(
     return AdmissionOut(
         strategy_id=res.strategy_id, strategy_version=res.strategy_version,
         account_id=res.account_id, allowed=res.allowed,
-        gates=[GateOut(**{
-            "key": g.key, "label": g.label, "passed": g.passed,
-            "reason": g.reason, "metrics": g.metrics,
-        }) for g in res.gates],
+        gates=[GateOut(key=g.key, label=g.label, passed=g.passed,
+                       reason=g.reason, metrics=g.metrics) for g in res.gates],
         decision_metrics=res.decision_metrics,
     )
 
@@ -348,7 +429,7 @@ async def deploy_live_run(
     magic = settings.LIVE_MAGIC_BASE + (uuid.uuid4().int & 0xFFFFFF)
     admission_snapshot = (
         {"scope": "demo", "gates": "skipped", "note": "模拟盘交易免准入四闸"}
-        if is_demo_scope else adm.snapshot()
+        if is_demo_scope else adm.snapshot()  # type: ignore[union-attr]
     )
     snapshot = {
         "execution_mode": "standard",
@@ -492,7 +573,9 @@ async def list_trades(
         .order_by(LiveTrade.open_time.desc(), LiveTrade.deal_ticket.desc())
         .offset((page - 1) * page_size).limit(page_size)
     )
-    return LiveTradeListResponse(items=list(result.scalars()), total=total)
+    return LiveTradeListResponse(
+        items=[LiveTradeOut.model_validate(r) for r in result.scalars()], total=total
+    )
 
 
 @router.get("/{run_id}/logs", response_model=LiveLogListResponse)
@@ -518,7 +601,9 @@ async def list_logs(
         select(LiveLog).where(*filters).order_by(LiveLog.seq.desc())
         .offset((page - 1) * page_size).limit(page_size)
     )
-    return LiveLogListResponse(items=list(result.scalars()), total=total)
+    return LiveLogListResponse(
+        items=[LiveLogOut.model_validate(r) for r in result.scalars()], total=total
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +797,21 @@ async def create_rule(
         raise HTTPException(status_code=422, detail="account 级规则必须提供 account_id")
     if payload.scope == "run" and payload.run_id is None:
         raise HTTPException(status_code=422, detail="run 级规则必须提供 run_id")
+    # 挂到哪个账户/运行上，就得先拥有它——否则等于给别人的账户立规矩。
+    if payload.scope == "global":
+        # global 规则对所有账户生效（引擎里 global 与 account/run 是并集）：
+        # 一条规则改的是整个平台的默认风控，属于管理员动作。
+        await _require_role(db, current, ("admin",))
+    elif payload.scope == "account":
+        acct = await db.get(MT5Account, payload.account_id)
+        if acct is None or (
+            acct.user_id is not None and str(acct.user_id) != current["sub"]
+        ):
+            raise HTTPException(status_code=404, detail="MT5 账户不存在")
+    else:  # run
+        run = await db.get(LiveRun, payload.run_id)
+        if run is None or str(run.user_id) != current["sub"]:
+            raise HTTPException(status_code=404, detail="实盘任务不存在")
     rule = RiskRule(
         scope=payload.scope, account_id=payload.account_id, run_id=payload.run_id,
         type=payload.type, threshold=_dec(payload.threshold, 6),
@@ -746,7 +846,7 @@ async def list_rules(
     account_id: uuid.UUID | None = Query(default=None),
     run_id: uuid.UUID | None = Query(default=None),
 ) -> list[RiskRule]:
-    filters = []
+    filters = [] if await _is_admin(db, current) else [_rule_visible(current)]
     if account_id is not None:
         filters.append(RiskRule.account_id == account_id)
     if run_id is not None:
@@ -763,9 +863,7 @@ async def update_rule(
     current: CurrentUser, db: DBSession, request: Request
 ) -> RiskRule:
     await _require_role(db, current, ("admin", "trader"))
-    rule = await db.get(RiskRule, rule_id)
-    if rule is None:
-        raise HTTPException(status_code=404, detail="规则不存在")
+    rule = await _owned_rule(db, rule_id, current)
     old = {"threshold": float(rule.threshold), "action": rule.action,
            "enabled": rule.enabled}
     if payload.threshold is not None:
@@ -799,9 +897,7 @@ async def delete_rule(
     rule_id: uuid.UUID, current: CurrentUser, db: DBSession, request: Request
 ) -> None:
     await _require_role(db, current, ("admin", "trader"))
-    rule = await db.get(RiskRule, rule_id)
-    if rule is None:
-        raise HTTPException(status_code=404, detail="规则不存在")
+    rule = await _owned_rule(db, rule_id, current)
     await db.delete(rule)
     await db.commit()
     await audit_record("rule_change", actor=_actor(current, request),
@@ -830,7 +926,9 @@ async def list_risk_events(
         select(RiskEvent).where(*filters).order_by(RiskEvent.created_at.desc())
         .offset((page - 1) * page_size).limit(page_size)
     )
-    return RiskEventListResponse(items=list(result.scalars()), total=total)
+    return RiskEventListResponse(
+        items=[RiskEventOut.model_validate(r) for r in result.scalars()], total=total
+    )
 
 
 @router.get("/alerts", response_model=AlertListResponse)
@@ -853,21 +951,30 @@ async def list_alerts(
         select(AlertEvent).where(*filters).order_by(AlertEvent.created_at.desc())
         .offset((page - 1) * page_size).limit(page_size)
     )
-    return AlertListResponse(items=list(result.scalars()), total=total, unread=unread)
+    return AlertListResponse(
+        items=[AlertOut.model_validate(r) for r in result.scalars()], total=total, unread=unread
+    )
 
 
 @router.post("/alerts/read-all", response_model=dict)
 async def mark_all_alerts_read(
     current: CurrentUser, db: DBSession
 ) -> dict:
+    """把**我自己的**告警标为已读；管理员则是全平台。
+
+    「全部已读」曾经是无条件的全表 UPDATE：任何人点一下，别人账户的告警、
+    以及「网关异常重启，请核对持仓」这类平台级告警，全都变成已读——一条
+    提醒在真正看到之前就消失了。
+    """
     from sqlalchemy import update
 
+    where = [] if await _is_admin(db, current) else [_alert_markable(current)]
     result = await db.execute(
-        update(AlertEvent).where(AlertEvent.is_read.is_(False))
+        update(AlertEvent).where(AlertEvent.is_read.is_(False), *where)
         .values(is_read=True)
     )
     await db.commit()
-    return {"status": "ok", "marked": int(result.rowcount or 0)}
+    return {"status": "ok", "marked": int(result.rowcount or 0)}  # type: ignore[attr-defined]
 
 
 @router.post("/alerts/{alert_id}/read", response_model=AlertOut)
@@ -877,6 +984,15 @@ async def mark_alert_read(
     row = await db.get(AlertEvent, alert_id)
     if row is None:
         raise HTTPException(status_code=404, detail="告警不存在")
+    if not await _is_admin(db, current):
+        mine = (await db.execute(
+            select(AlertEvent.id).where(
+                AlertEvent.id == alert_id, _alert_markable(current)
+            )
+        )).scalar_one_or_none()
+        if mine is None:
+            # 别人的告警 / 平台级告警：404（不是 403——不给出「这个 id 存在」）
+            raise HTTPException(status_code=404, detail="告警不存在")
     row.is_read = True
     db.add(row)
     await db.commit()

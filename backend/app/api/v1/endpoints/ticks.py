@@ -65,6 +65,8 @@ async def request_sync(
     await db.commit()
     await db.refresh(job)
 
+    # 审计行不挂在请求会话上：此处状态早已提交，传 db=db 的话没人再 commit，
+    # 这行会随请求会话一起被回滚掉——审计静默丢失，事后查不到任何人做过什么。
     await audit.record(
         "tick.sync_request",
         actor=audit.AuditActor(
@@ -75,7 +77,6 @@ async def request_sync(
         target_type="symbol",
         target_id=symbol,
         params={"start": body.start, "end": body.end},
-        db=db,
     )
     queue = tick_sync.get_tick_sync_queue()
     queue.enqueue(str(job.id))
@@ -144,6 +145,8 @@ async def purge_symbol(
     """Delete every stored tick for the symbol (audit-logged)."""
     sym = symbol.strip().upper()
     deleted = await tick_sync.TickSyncQueue.purge_symbol(sym)
+    # 审计行不挂在请求会话上：此处状态早已提交，传 db=db 的话没人再 commit，
+    # 这行会随请求会话一起被回滚掉——审计静默丢失，事后查不到任何人做过什么。
     await audit.record(
         "tick.purge",
         actor=audit.AuditActor(
@@ -154,7 +157,6 @@ async def purge_symbol(
         target_type="symbol",
         target_id=sym,
         params={"deleted": deleted},
-        db=db,
     )
     return TickPurgeResponse(symbol=sym, deleted=deleted)
 

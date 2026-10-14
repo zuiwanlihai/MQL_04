@@ -85,6 +85,10 @@ def stub(monkeypatch):
             s.reject = holder["reject"]
         return s
 
+    # 被测代码走 GatewayClient.for_registered_node(url)：替代品要能应答，
+    # 否则用例会红在「接口不匹配」上。凭据该不该带见 test_gateway_key_scope.py。
+    factory.for_registered_node = factory
+
     monkeypatch.setattr(mt_mod, "GatewayClient", factory)
     yield holder
 
@@ -185,6 +189,23 @@ def _audit_rows(client, action: str) -> list[tuple[str, dict]]:
     return client.portal.call(_q)
 
 
+def _risk_events(client, account_id: str) -> list[dict]:
+    async def _q():
+        from sqlalchemy import select
+
+        from app.engine.session import AsyncSessionLocal
+        from app.models import RiskEvent
+
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(RiskEvent).where(RiskEvent.account_id == uuid.UUID(account_id))
+                .order_by(RiskEvent.created_at)
+            )).scalars().all()
+            return [{"rule_type": r.rule_type, "action_taken": r.action_taken} for r in rows]
+
+    return client.portal.call(_q)
+
+
 @pytest.fixture(autouse=True)
 def _enable(client, monkeypatch):
     import app.services.manual_trade as mt_mod
@@ -263,6 +284,42 @@ def test_order_blocked_by_platform_lot_cap(client, token, stub):
     assert r.json()["success"] is False
     assert "平台上限" in (r.json()["error_message"] or "")
     assert stub["gw"].orders_sent == []
+
+
+def test_order_count_failure_fails_closed(client, token, stub, monkeypatch):
+    """2.4：限频计数取不到时必须拒绝，并且留下审计与风控事件。
+
+    旧实现把查询失败折算成「0 单」——限频规则于是在数据库有状况时静默失效，
+    正是它最该生效的时候。这里让计数函数直接返回 None（即查询失败的返回值）
+    来复现，断言的是**整条链路**的失效方向，而不是某一个函数。
+    """
+    import app.services.manual_trade as mt_mod
+
+    acct_id = _seed_account(client, token, host="10.20.0.9", port=8209)
+    _add_rule(client, acct_id, rtype="max_orders_per_minute", threshold=20)
+    monkeypatch.setattr(mt_mod, "_recent_manual_order_count", _async_none)
+
+    r = client.post(f"{API}/order",
+                    json={"account_id": acct_id, "symbol": "EURUSD",
+                          "side": "buy", "volume": 0.1},
+                    headers=_auth(token))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is False
+    assert body["error_code"] == "RISK_CHECK_UNAVAILABLE", body
+    assert "无法" in body["error_message"]
+    assert stub["gw"].orders_sent == [], "判定为不可信的单子绝不能到达券商"
+
+    rows = _audit_rows(client, "manual_order")
+    assert rows[-1][0] == "blocked" and rows[-1][2] == "block"
+
+    events = _risk_events(client, acct_id)
+    assert events, "fail-closed 拒绝必须留下风控事件（告警）"
+    assert events[-1]["rule_type"] == "max_orders_per_minute"
+
+
+async def _async_none(*_a, **_kw) -> None:
+    return None
 
 
 def test_readonly_account_rejected(client, token, stub):

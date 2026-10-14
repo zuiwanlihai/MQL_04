@@ -26,6 +26,7 @@ from app.config import settings
 from app.dependencies import DBSession
 from app.models import GatewayNode
 from app.schemas.ea_bridge import (
+    EACommand,
     EAPairRequest,
     EAPairResponse,
     EAResultRequest,
@@ -145,7 +146,7 @@ async def ea_sync(payload: EASyncRequest, request: Request, db: DBSession) -> EA
     if payload.account:
         registry.set_account(node_id, payload.account)
 
-    commands = registry.drain_commands(node_id)
+    commands = [EACommand.model_validate(c) for c in registry.drain_commands(node_id)]
     registry.touch(node_id, time.time())
 
     # EA 节点无 HTTP 探活（心跳循环按 type 跳过）——sync 即最后活跃证明。

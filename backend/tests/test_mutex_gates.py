@@ -49,6 +49,11 @@ class ProbeStub:
         self.base_url = base_url
         ProbeStub.instances.append(self)
 
+    @classmethod
+    def for_registered_node(cls, base_url: str | None = None) -> ProbeStub:
+        # 被测代码走 GatewayClient.for_registered_node()：桩要能应答。
+        return cls(base_url)
+
     async def health(self) -> dict:
         if ProbeStub.fail:
             from app.services.gateway_client import GatewayError

@@ -47,5 +47,8 @@ class AuditListResponse(BaseModel):
 class AuditVerifyOut(BaseModel):
     total: int = Field(description="链上记录总数")
     ok: bool = Field(description="链是否完好")
-    broken_index: int = Field(description="首个断链位置（-1=完好）")
+    broken_index: int = Field(description="首个异常位置（-1=完好）")
+    verdict: str = Field(default="ok", description="ok | fork | critical")
+    findings_total: int = Field(default=0, description="异常处数")
+    reason: str | None = Field(default=None, description="首个异常的人话说明")
     checked_at: datetime

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -46,6 +47,20 @@ router = APIRouter()
 GatewayDep = Annotated[GatewayClient, Depends(get_gateway_client)]
 
 _ACCOUNT_TYPES = ("demo", "real", "contest")
+
+
+def _to_decimal(value: float | Decimal | int | None) -> Decimal:
+    """网关 account dict 里的余额类字段是 float，而 MT5Account 模型声明为
+    Mapped[Decimal]（数据库 Numeric 列）。float → Decimal 必须显式转换，
+    否则 mypy 报 arg-type/assignment。用 str 中转避免 float 二进制不精确：
+    Decimal(0.1) = Decimal('0.1000000000000000055511151231257827021181583404541015625')
+    Decimal(str(0.1)) = Decimal('0.1')
+    """
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
 
 
 def _actor(current: dict, request: Request | None = None) -> AuditActor:
@@ -96,14 +111,23 @@ async def _probe(
     M13: an explicit ``gateway_url`` wins; otherwise a selected
     ``gateway_node_id`` probes THAT node (in-flow binding for paper/live),
     otherwise the injected default client is used.
+
+    凭据按来源分岔：注册表节点与平台默认客户端带 ``X-Gateway-Key``，
+    ``gateway_url`` 是用户自填的地址——请求照发，但不带任何凭据（2.6）。
     """
-    custom_url = payload.gateway_url
-    if custom_url is None and payload.gateway_node_id is not None and db is not None:
+    client = gateway
+    own_client = False  # 自建客户端要自己关；注入的默认客户端由依赖管
+    if payload.gateway_url:
+        # 用户自填的地址：可能是任意主机——探活照做，但绝不附带平台密钥。
+        client = GatewayClient(payload.gateway_url)
+        own_client = True
+    elif payload.gateway_node_id is not None and db is not None:
         node = await db.get(GatewayNode, payload.gateway_node_id)
         if node is None:
             raise HTTPException(status_code=404, detail="网关节点不存在")
-        custom_url = node_base_url(node.host, node.port)
-    client = GatewayClient(custom_url) if custom_url else gateway
+        # 注册表里的节点：管理员注册或配对码写入，是「自己的」，带密钥。
+        client = GatewayClient.for_registered_node(node_base_url(node.host, node.port))
+        own_client = True
     try:
         raw = await client.login(payload.login, payload.password, payload.server)
     except GatewayLoginError as exc:
@@ -111,7 +135,7 @@ async def _probe(
     except GatewayError as exc:
         raise HTTPException(status_code=503, detail=exc.detail) from exc
     finally:
-        if custom_url:
+        if own_client:
             await client.aclose()
     return _map_probe(raw)
 
@@ -179,12 +203,12 @@ async def bind_account(
         account_type=probe.account_type,
         leverage=probe.leverage,
         currency=probe.currency,
-        balance=probe.balance,
-        credit=probe.credit,
-        equity=probe.equity,
-        margin=probe.margin,
-        margin_free=probe.margin_free,
-        margin_level=probe.margin_level,
+        balance=_to_decimal(probe.balance),
+        credit=_to_decimal(probe.credit),
+        equity=_to_decimal(probe.equity),
+        margin=_to_decimal(probe.margin),
+        margin_free=_to_decimal(probe.margin_free),
+        margin_level=_to_decimal(probe.margin_level),
         is_connected=True,
         is_trade_allowed=probe.is_trade_allowed,
         gateway_node_id=node.id,
@@ -243,12 +267,12 @@ async def sync_account(
         gateway,
     )
 
-    account.balance = probe.balance
-    account.credit = probe.credit
-    account.equity = probe.equity
-    account.margin = probe.margin
-    account.margin_free = probe.margin_free
-    account.margin_level = probe.margin_level
+    account.balance = _to_decimal(probe.balance)
+    account.credit = _to_decimal(probe.credit)
+    account.equity = _to_decimal(probe.equity)
+    account.margin = _to_decimal(probe.margin)
+    account.margin_free = _to_decimal(probe.margin_free)
+    account.margin_level = _to_decimal(probe.margin_level)
     account.leverage = probe.leverage
     account.is_connected = True
     account.is_trade_allowed = probe.is_trade_allowed
@@ -409,12 +433,12 @@ async def activate_on_gateway(
             db,
         )
 
-    account.balance = probe.balance
-    account.credit = probe.credit
-    account.equity = probe.equity
-    account.margin = probe.margin
-    account.margin_free = probe.margin_free
-    account.margin_level = probe.margin_level
+    account.balance = _to_decimal(probe.balance)
+    account.credit = _to_decimal(probe.credit)
+    account.equity = _to_decimal(probe.equity)
+    account.margin = _to_decimal(probe.margin)
+    account.margin_free = _to_decimal(probe.margin_free)
+    account.margin_level = _to_decimal(probe.margin_level)
     account.leverage = probe.leverage
     account.is_connected = True
     account.is_trade_allowed = probe.is_trade_allowed
@@ -467,7 +491,7 @@ async def active_gateways(
         if node.type == "ea_bridge":
             summary: AccountProbeResult | None = _probe_from_row(bound)
         else:
-            client = GatewayClient(node_base_url(node.host, node.port))
+            client = GatewayClient.for_registered_node(node_base_url(node.host, node.port))
             summary = None
             try:
                 raw = (await client.health()).get("account")

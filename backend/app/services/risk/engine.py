@@ -76,7 +76,7 @@ def evaluate(
     positions: list[dict],
     rules: list[dict],
     symbol_info: dict | None = None,
-    orders_this_minute: int = 0,
+    orders_this_minute: int | None = 0,
     recent_deals: list[dict] | None = None,
     closed_trades: list[dict] | None = None,
     registry_open_times: list[int] | None = None,
@@ -177,6 +177,11 @@ def evaluate(
     # ── 6. order frequency (run-scoped, parent counts the last minute) ──
     if is_open:
         for r in _typed(rules, "max_orders_per_minute"):
+            if orders_this_minute is None:
+                # 计数拿不到 ⇒ 不能默认「这一分钟一单没有」。风控的失效方向必须
+                # 是拒绝：这条规则本来就在拦「下单太密」，而它恰恰会在系统有状况
+                # （审计表查询失败）时最需要生效。
+                return _unavailable(r)
             if orders_this_minute + 1 > _f(r["threshold"]) + 1e-9:
                 return _blocked(r, float(orders_this_minute + 1))
 
@@ -327,6 +332,24 @@ def evaluate(
 
 def _typed(rules: list[dict], type_: str) -> list[dict]:
     return [r for r in rules if r.get("type") == type_ and r.get("enabled", True)]
+
+
+def _unavailable(r: dict) -> RiskVerdict:
+    """规则所需的观测值取不到：按拒绝处置，并如实说明是检查本身失效。
+
+    单独一个 error_code 是必要的——它和「触发了阈值」是两回事，运维要能从
+    回执里一眼看出该去修数据源，而不是去调规则阈值。
+    """
+    return RiskVerdict(
+        allow=False, error_code="RISK_CHECK_UNAVAILABLE",
+        error_message=(
+            f"风控检查 [{r['type']}] 无法取得当前计数（数据源不可用），"
+            f"按拒绝处置；请检查后端日志与数据库状态"
+        ),
+        action="reject",
+        rule_id=str(r.get("id") or ""), rule_type=str(r["type"]),
+        threshold=_f(r.get("threshold")), observed=-1.0,
+    )
 
 
 def _blocked(r: dict, observed: float) -> RiskVerdict:

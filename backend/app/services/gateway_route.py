@@ -86,7 +86,7 @@ async def probe_active_account_type(
         return None
     from app.services.gateway_client import GatewayClient, GatewayError
 
-    client = GatewayClient(node_base_url(node.host, node.port))
+    client = GatewayClient.for_registered_node(node_base_url(node.host, node.port))
     try:
         raw = (await client.health()).get("account") or {}
     except GatewayError:

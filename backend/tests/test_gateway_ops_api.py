@@ -32,6 +32,10 @@ class StubOpsGateway:
         # don't multiply the alert count.
         self._default = not base_url or base_url.endswith("127.0.0.1:8090")
 
+    @classmethod
+    def for_registered_node(cls, base_url=None, *a, **k):
+        return cls(base_url, *a, **k)
+
     async def selfcheck(self):
         return {"all_pass": False, "checked_at": "2026-10-11T10:00:00+00:00",
                 "items": [{"key": "algo_trade", "label": "允许算法交易",

@@ -113,6 +113,24 @@ def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _audit_actions(client: TestClient, target_id: str) -> list[str]:
+    """该目标上留下的审计动作（按写入顺序）。"""
+
+    async def _q() -> list[str]:
+        from sqlalchemy import select
+
+        from app.engine.session import AsyncSessionLocal
+        from app.models import AuditLog
+
+        async with AsyncSessionLocal() as db:
+            return list((await db.execute(
+                select(AuditLog.action).where(AuditLog.target_id == target_id)
+                .order_by(AuditLog.seq)
+            )).scalars().all())
+
+    return client.portal.call(_q)
+
+
 @pytest.fixture
 def token(client: TestClient) -> str:
     r = client.post(
@@ -405,6 +423,10 @@ def test_wf_lifecycle_and_aggregation(gw, client, token, strategy):
     kinds = {i["kind"] for i in lst.json()["items"]}
     assert "walk_forward" in kinds
     assert lst.json()["items"][0]["status"] == "completed"
+
+    # 审计留痕：创建分析是事后补记，行必须真的落库（写进请求会话没人 commit
+    # 的话，接口照样 201，库里却查不到谁拆过这段回测）。
+    assert _audit_actions(client, ana["id"]) == ["backtest.walk_forward_create"]
 
 
 def test_wf_anchored_is_starts_at_range_start(gw, client, token, strategy, monkeypatch):

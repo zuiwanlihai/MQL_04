@@ -183,7 +183,7 @@ async def delete_entry(
         )
     )
     await db.commit()
-    return {"deleted": res.rowcount or 0}
+    return {"deleted": res.rowcount or 0}  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
 
 
 @router.delete("")
@@ -196,4 +196,4 @@ async def clear_all(
     t = _norm_account_type(account_type)
     res = await db.execute(sa_delete(KlineCache).where(KlineCache.account_type == t))
     await db.commit()
-    return {"deleted": res.rowcount or 0}
+    return {"deleted": res.rowcount or 0}  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()

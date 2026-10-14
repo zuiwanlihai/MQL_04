@@ -536,7 +536,8 @@ def test_paper_start_ea_success_spawns_runner(client, monkeypatch):
     resp_task = _spawn_fake_ea(client, node_id, bars, _EA_INFO)
 
     class _FakeSup:
-        def __init__(self, rid, directory, module=None):
+        # 吞掉构造参数（stall_timeout 等）：这里只关心 manager 的启动序列。
+        def __init__(self, rid, directory, module=None, **_kw):
             pass
 
         async def run(self, on_event, timeout=None):

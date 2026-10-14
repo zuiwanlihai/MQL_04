@@ -25,6 +25,7 @@ from app.schemas.auth import (
     TwoFAStatusOut,
     UserLogin,
     UserRegister,
+    UserResponse,
 )
 from app.services import totp
 from app.services.credentials import decrypt_secret, encrypt_secret
@@ -76,7 +77,7 @@ async def _issue_session(
         access_token=access_token,
         refresh_token=raw_refresh,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        user=user,
+        user=UserResponse.model_validate(user),
     )
 
 
@@ -299,7 +300,7 @@ async def refresh_session(
         access_token=access_token,
         refresh_token=raw_refresh,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        user=user,
+        user=UserResponse.model_validate(user),
     )
 
 

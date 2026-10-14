@@ -108,6 +108,12 @@ def _deviation_row(
     slip = _adverse_slippage_points(deal, point)
     slip_out: float | None = None
     actual_spread_pts: float | None = None
+    # bid/ask may be None (no snapshot).  _adverse_slippage_points already
+    # returns None in that case, so the ``slip is None`` branches below fold
+    # everything into drift and never use bid/ask.  Mypy can't track this
+    # equivalence, so guard the float() calls explicitly.
+    _bid: float | None = float(deal.bid_at_request) if deal.bid_at_request is not None else None
+    _ask: float | None = float(deal.ask_at_request) if deal.ask_at_request is not None else None
     if deal.direction == "buy":
         # exact additive split: slip + spread + drift == actual - theoretical
         total_pts = (price - theoretical) / pt
@@ -115,10 +121,9 @@ def _deviation_row(
             drift_pts = total_pts  # degrade: fold everything into drift
         else:
             slip_out = slip
-            bid = float(deal.bid_at_request)
-            ask = float(deal.ask_at_request)
-            actual_spread_pts = (ask - bid) / pt
-            drift_pts = (bid - theoretical) / pt
+            assert _bid is not None and _ask is not None
+            actual_spread_pts = (_ask - _bid) / pt
+            drift_pts = (_bid - theoretical) / pt
     else:
         # sell fills at bid — no explicit spread cost; total = slip + drift
         if slip is None:
@@ -126,8 +131,8 @@ def _deviation_row(
             drift_pts = (theoretical - price) / pt
         else:
             slip_pts = slip
-            bid = float(deal.bid_at_request)
-            drift_pts = (theoretical - bid) / pt
+            assert _bid is not None
+            drift_pts = (theoretical - _bid) / pt
         slip_out = slip_pts
         total_pts = slip_pts + drift_pts
     vol = float(deal.volume)

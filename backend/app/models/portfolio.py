@@ -16,6 +16,7 @@ same convention as backtest tasks / analyses).
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -62,7 +63,7 @@ class PortfolioBacktest(BaseModel, kw_only=True):
     timeframe: Mapped[str] = mapped_column(
         String(8), nullable=False, comment="Bar period shared by every child.",
     )
-    total_deposit: Mapped[object] = mapped_column(
+    total_deposit: Mapped[Decimal] = mapped_column(
         Numeric(18, 4), nullable=False,
         comment="Sum of per-symbol deposits actually allocated.",
     )

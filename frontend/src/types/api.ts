@@ -1433,6 +1433,10 @@ export interface AuditVerifyResult {
   total: number;
   ok: boolean;
   broken_index: number;
+  /** ok | fork | critical —— 分叉（并发写入的旧病灶，内容完好）与篡改分开报 */
+  verdict: 'ok' | 'fork' | 'critical';
+  findings_total: number;
+  reason: string | null;
   checked_at: string;
 }
 

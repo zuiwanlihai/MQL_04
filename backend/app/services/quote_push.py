@@ -172,7 +172,7 @@ class QuoteHub:
             await ws.send_json(frame)
             return True
         except Exception:  # noqa: BLE001 — dead/slow client: drop, never block the pump
-            await self.unregister(ws)
+            self.unregister(ws)  # noqa: ARG006 — unregister 非 async，不需 await
             return False
 
     # -- pump ------------------------------------------------------------------

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import cast
 
 from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import select
@@ -18,6 +19,7 @@ from app.dependencies import CurrentUser, DBSession
 from app.models import NotificationChannel
 from app.schemas.notify import (
     ChannelCreate,
+    ChannelKind,
     ChannelOut,
     ChannelTestOut,
     ChannelUpdate,
@@ -71,7 +73,7 @@ async def _get_owned_channel(db, channel_id: uuid.UUID, current: dict) -> Notifi
 
 def _out(ch: NotificationChannel) -> ChannelOut:
     return ChannelOut(
-        id=ch.id, kind=ch.kind, target_masked=mask_target(ch.kind, ch.target),
+        id=ch.id, kind=cast(ChannelKind, ch.kind), target_masked=mask_target(ch.kind, ch.target),
         min_level=ch.min_level, enabled=ch.enabled, verified_at=ch.verified_at,
         created_at=ch.created_at,
     )

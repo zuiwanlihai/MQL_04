@@ -42,6 +42,32 @@ def token(client: TestClient) -> str:
     return r.json()["access_token"]
 
 
+def _promote(client: TestClient, token: str, role: str = "admin") -> None:
+    """把这个令牌的用户提成 admin。
+
+    注册/删除网关节点是管理员操作（2.6：注册表就是「平台认可的网关」名单，
+    而平台会给名单里每个地址送 X-Gateway-Key）。首个注册用户虽然是天然的
+    admin，但同一个测试库里别的用例早就注册过用户了——必须显式提权，否则
+    这些用例跑不跑得通取决于执行顺序。
+    """
+    from jose import jwt
+    from sqlalchemy import update
+
+    from app.config import settings
+    from app.engine.session import AsyncSessionLocal
+    from app.models import User
+
+    uid = jwt.decode(token, settings.JWT_SECRET_KEY,
+                     algorithms=[settings.JWT_ALGORITHM])["sub"]
+
+    async def _up() -> None:
+        async with AsyncSessionLocal() as db:
+            await db.execute(update(User).where(User.id == uuid.UUID(uid))
+                             .values(role=role))
+            await db.commit()
+    client.portal.call(_up)
+
+
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -55,6 +81,7 @@ def test_create_node_probe_failure_goes_offline(
     client: TestClient, token: str
 ) -> None:
     # 探活一个必然拒绝连接的端口 → 201 但 status=offline
+    _promote(client, token)
     r = client.post(
         f"{API}/nodes",
         json={"name": "死节点", "host": "127.0.0.1", "port": 9},
@@ -83,6 +110,7 @@ def test_create_node_probe_failure_goes_offline(
 
 
 def test_delete_node_and_404(client: TestClient, token: str) -> None:
+    _promote(client, token)
     r = client.post(
         f"{API}/nodes",
         json={"name": "待删", "host": "127.0.0.1", "port": 10},
@@ -101,6 +129,7 @@ def test_delete_node_guards_primary_and_bound_accounts(
     client: TestClient, token: str
 ) -> None:
     # 有绑定账户的节点 → 409（M8：防止级联静默解绑账户）
+    _promote(client, token)
     r = client.post(
         f"{API}/nodes",
         json={"name": "带账户", "host": "127.0.0.1", "port": 12},
@@ -156,6 +185,7 @@ def test_delete_node_guards_primary_and_bound_accounts(
 
 def test_health_logs_order_and_limits(client: TestClient, token: str) -> None:
     # 建节点 → 拿 node_id
+    _promote(client, token)
     r = client.post(
         f"{API}/nodes",
         json={"name": "日志节点", "host": "127.0.0.1", "port": 11},

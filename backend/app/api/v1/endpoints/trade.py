@@ -12,8 +12,11 @@ import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import CurrentUser, DBSession
+from app.models import MT5Account, User
 from app.schemas.trade import (
     ManualCancelRequest,
     ManualCloseRequest,
@@ -74,6 +77,35 @@ async def get_deals(
 
 # ── trade whitelist (gateway gray-release gate; audited) ───────
 
+async def _assert_login_owned(db: AsyncSession, login: int, current: dict) -> None:
+    """只能操作**自己绑定过的**登录号；管理员例外。
+
+    白名单是网关级、全平台共享的一份名单：把别人的登录号移出去，他的账户当场
+    就下不了单；把任意登录号加进来，等于替别人的终端开闸。顶栏的「加入白名单」
+    是自助功能（顺手把自己正在用的账户加进去），所以这里按**归属**放行而不是
+    按角色——功能照旧，跨用户的那条路堵死。
+
+    返回 403 而不是仓内既有的 404 约定：login 是调用方自己传进来的 broker 编号，
+    不是一个平台对象 id，404 在这里既没有对应的对象、也说不清原因。`user_id is
+    None` 的账户视为共享，与 ``manual_trade._owned_account`` 一致。
+    """
+    uid = uuid.UUID(current["sub"])
+    user = await db.get(User, uid)
+    if user is not None and (user.role == "admin" or user.is_superuser):
+        return
+    owned = (await db.execute(
+        select(MT5Account.id).where(
+            MT5Account.login == login,
+            (MT5Account.user_id == uid) | MT5Account.user_id.is_(None),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if owned is None:
+        raise HTTPException(
+            status_code=403,
+            detail="该 MT5 登录号不属于你的账户，无法操作交易白名单",
+        )
+
+
 @router.get("/whitelist")
 async def get_trade_whitelist(current: CurrentUser) -> dict:
     """网关交易白名单状态（{trade_enabled, logins}）。"""
@@ -88,9 +120,10 @@ async def get_trade_whitelist(current: CurrentUser) -> dict:
 
 @router.post("/whitelist")
 async def add_trade_whitelist(
-    payload: WhitelistAddIn, current: CurrentUser, request: Request
+    payload: WhitelistAddIn, current: CurrentUser, db: DBSession, request: Request
 ) -> dict:
     """把 MT5 登录号加入网关交易白名单（立即生效并持久化到网关 .env）。"""
+    await _assert_login_owned(db, payload.login, current)
     gw = GatewayClient()
     try:
         out = await gw.trade_whitelist_add(payload.login)
@@ -111,9 +144,10 @@ async def add_trade_whitelist(
 
 @router.delete("/whitelist/{login}")
 async def remove_trade_whitelist(
-    login: int, current: CurrentUser, request: Request
+    login: int, current: CurrentUser, db: DBSession, request: Request
 ) -> dict:
     """把 MT5 登录号移出网关交易白名单（立即生效并持久化）。"""
+    await _assert_login_owned(db, login, current)
     gw = GatewayClient()
     try:
         out = await gw.trade_whitelist_remove(login)

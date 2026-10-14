@@ -57,6 +57,10 @@ from app.services.backtest.supervisor import (
     RunnerSupervisor,
     SuperviseResult,
 )
+from app.services.fault_state import (  # P0-4 统一故障状态机
+    FaultType,
+    gate_fault,
+)
 from app.services.gateway_client import GatewayClient, GatewayError
 from app.services.strategy_validator import validate_source
 
@@ -141,7 +145,7 @@ class BacktestQueue:
                     .values(status="cancelled", completed_at=datetime.now(UTC))
                 )
                 await db.commit()
-                return "cancelled" if res.rowcount else row.status
+                return "cancelled" if res.rowcount else row.status  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
             if row.status in ("running", "cancelling"):
                 await db.execute(
                     update(BacktestTask)
@@ -159,6 +163,13 @@ class BacktestQueue:
         """Reconcile DB state after a restart: running→failed, pending→requeue."""
         now = datetime.now(UTC)
         async with AsyncSessionLocal() as db:
+            # 先查出受影响的 task id，bulk update 后逐个 emit 结构化故障
+            affected_ids = list(
+                await db.scalars(
+                    select(BacktestTask.id)
+                    .where(BacktestTask.status.in_(["running", "cancelling"]))
+                )
+            )
             await db.execute(
                 update(BacktestTask)
                 .where(BacktestTask.status.in_(["running", "cancelling"]))
@@ -175,6 +186,14 @@ class BacktestQueue:
                 )
             )
             await db.commit()
+            # P0-4 结构化故障输出：批量 emit 服务重启导致的中断
+            for tid in affected_ids:
+                await gate_fault(
+                    fault_type=FaultType.STARTUP_FAILED,
+                    action_taken="服务重启导致回测任务中断，标记为失败",
+                    run_id=tid,
+                    detail="服务重启导致任务中断，请重新发起回测",
+                ).emit(db=db)
         for tid in pending:
             self.enqueue(str(tid))
         if pending:
@@ -205,7 +224,7 @@ class BacktestQueue:
                 .values(status="running", started_at=datetime.now(UTC))
             )
             await db.commit()
-            if not res.rowcount:
+            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
                 return  # already cancelled / not pending
             task = await db.get(BacktestTask, uid)
             assert task is not None
@@ -456,7 +475,7 @@ class BacktestQueue:
                     ticket=int(t["ticket"]),
                     direction=str(t["direction"]),
                     volume=_dec(t["volume"], 4),
-                    open_time=_dt(t["open_time"]),
+                    open_time=_dt(t["open_time"]) or datetime(1970, 1, 1, tzinfo=UTC),
                     open_price=_dec(t["open_price"]),
                     base_price=_dec(t["base_price"]),
                     close_time=_dt(t["close_time"]),
@@ -585,6 +604,22 @@ class BacktestQueue:
         task.completed_at = datetime.now(UTC)
         db.add(task)
         await db.commit()
+        # P0-4 结构化故障输出：回测失败收尾
+        ft = FaultType.BACKTEST_FAILED
+        if timed_out or code in ("RESOURCE_TIMEOUT", "TIMED_OUT"):
+            ft = FaultType.STRATEGY_TIMEOUT
+        elif code == "CANCELLED":
+            ft = FaultType.STARTUP_FAILED
+        elif code in ("ILLEGAL_IMPORT", "SANDBOX_VIOLATION"):
+            ft = FaultType.STRATEGY_ILLEGAL_IMPORT
+        elif code in ("DATA_UNAVAILABLE", "NO_DATA", "DATA_FETCH"):
+            ft = FaultType.DATA_FEED_STALE
+        await gate_fault(
+            fault_type=ft,
+            action_taken=f"回测失败（code={code}, timed_out={timed_out}）",
+            run_id=task.id,
+            detail=message,
+        ).emit(db=db)
 
     async def _load_cache_bars(self, symbol: str, timeframe: str) -> list[dict] | None:
         """Read bars from the shared kline_cache table; None if absent.

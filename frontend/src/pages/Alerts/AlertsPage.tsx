@@ -3,9 +3,11 @@ import { Link } from 'react-router-dom';
 import { Bell, CheckCheck, ChevronLeft, ChevronRight } from 'lucide-react';
 import NotifyChannelsCard from '@/components/alerts/NotifyChannelsCard';
 import AlertRulesCard from '@/components/alerts/AlertRulesCard';
-import { useAlertsPaged, useMarkAlertRead, useMarkAllAlertsRead } from '@/hooks/useLive';
+import { useAccounts } from '@/hooks/useAccounts';
+import { useAlertsPaged, useLiveRuns, useMarkAlertRead, useMarkAllAlertsRead } from '@/hooks/useLive';
 import { apiError } from '@/lib/api';
 import { relativeTime } from '@/lib/market';
+import { useAuthStore } from '@/store/useAuthStore';
 import type { AlertEvent } from '@/types/api';
 
 const LEVEL_META: Record<AlertEvent['level'], { label: string; cls: string; dot: string }> = {
@@ -37,6 +39,20 @@ export default function AlertsPage() {
   const markAll = useMarkAllAlertsRead();
   const data = list.data;
 
+  // 告警列表是平台级的（运维信号藏起来比露出来更危险），但**标记已读**只对自己
+  // 的告警生效：is_read 是共享的一个位，标了就是替全体标了。所以按钮要按归属
+  // 显隐，别让用户点出一句「告警不存在」。平台级告警（网关异常等）归管理员。
+  const user = useAuthStore((s) => s.user);
+  const isAdmin = user?.role === 'admin';
+  const accounts = useAccounts();
+  const runs = useLiveRuns({ page: 1, pageSize: 100 });
+  const myAccountIds = new Set((accounts.data?.items ?? []).map((a) => a.id));
+  const myRunIds = new Set((runs.data?.items ?? []).map((r) => r.id));
+  const canMarkRead = (a: AlertEvent) =>
+    isAdmin
+    || (a.account_id != null && myAccountIds.has(a.account_id))
+    || (a.run_id != null && myRunIds.has(a.run_id));
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-4 flex-wrap">
@@ -52,6 +68,7 @@ export default function AlertsPage() {
           type="button"
           className="btn-secondary"
           disabled={markAll.isPending || (data?.unread ?? 0) === 0}
+          title={isAdmin ? '标记全平台告警为已读' : '只标记与你账户 / 任务相关的告警；平台级告警由管理员处理'}
           onClick={() => markAll.mutate()}
         >
           <CheckCheck className="w-4 h-4" /> 全部标记已读
@@ -130,7 +147,7 @@ export default function AlertsPage() {
                         任务
                       </Link>
                     )}
-                    {!a.is_read && (
+                    {!a.is_read && canMarkRead(a) && (
                       <button
                         type="button"
                         className="text-xs text-gray-400 hover:text-gray-200 disabled:opacity-50"

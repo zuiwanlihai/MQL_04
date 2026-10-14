@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime
+from typing import Any, Callable
 
 from app.services.gateway_client import GatewayClient
 
@@ -40,7 +41,7 @@ _SPIKE_RATIO = 0.20
 
 
 def _issues_for(
-    code: str, severity: str, found: list[tuple], fmt: object
+    code: str, severity: str, found: list[Any], fmt: Callable[[int, Any], dict]
 ) -> list[dict]:
     """Render at most MAX_ISSUES_PER_CODE issues, prefixing a truncation note."""
     out = []

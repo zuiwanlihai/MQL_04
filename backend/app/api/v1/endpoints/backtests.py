@@ -24,6 +24,7 @@ from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal, cast
 
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
@@ -49,10 +50,12 @@ from app.schemas.backtest import (
     AnalysisOut,
     BacktestCreate,
     BacktestListResponse,
+    BacktestLogOut,
     BacktestRatingRequest,
     BacktestReportOut,
     BacktestTaskDetailOut,
     BacktestTaskOut,
+    BacktestTradeOut,
     LogListResponse,
     MonteCarloCreate,
     OptimizationCreate,
@@ -158,12 +161,12 @@ def _new_task(user_id: uuid.UUID, payload: BacktestCreate, source: str, snapshot
         timeframe=payload.timeframe,
         start_date=payload.start_date,
         end_date=payload.end_date,
-        initial_deposit=_dec(payload.initial_deposit),
+        initial_deposit=_dec(payload.initial_deposit) or Decimal("0"),
         leverage=payload.leverage,
         strategy_version=snapshot["strategy_version"],
         spread_mode=payload.spread_mode,
         spread_points=_dec(payload.spread_points, 2),
-        commission_per_lot=_dec(payload.commission_per_lot),
+        commission_per_lot=_dec(payload.commission_per_lot) or Decimal("0"),
         slippage_points=_dec(payload.slippage_points, 2),
         warmup_bars=payload.warmup_bars,
         parameters=payload.parameters,
@@ -317,7 +320,7 @@ async def list_backtests(
     )
     items = list(result.scalars())
     return BacktestListResponse(
-        items=items, total=total, page=page, page_size=page_size,
+        items=[BacktestTaskOut.model_validate(r) for r in items], total=total, page=page, page_size=page_size,
         total_pages=max(math.ceil(total / page_size), 1),
     )
 
@@ -415,11 +418,17 @@ async def list_analyses(
     for row in rows:
         if row.status == "running":
             if row.kind == "walk_forward":
-                row = await aggregate_walk_forward(db, row)
+                updated = await aggregate_walk_forward(db, row)
+                if updated is not None:
+                    row = updated
             elif row.kind == "optimization":
-                row = await aggregate_optimization(db, row)
+                updated = await aggregate_optimization(db, row)
+                if updated is not None:
+                    row = updated
         refreshed.append(row)
-    return AnalysisListResponse(items=refreshed, total=total)
+    return AnalysisListResponse(
+        items=[AnalysisOut.model_validate(r) for r in refreshed], total=total,
+    )
 
 
 @router.get("/analyses/{analysis_id}", response_model=AnalysisOut)
@@ -429,9 +438,13 @@ async def get_analysis(
     row = await _get_owned_analysis(db, analysis_id, current)
     if row.status == "running":
         if row.kind == "walk_forward":
-            row = await aggregate_walk_forward(db, row)
+            updated = await aggregate_walk_forward(db, row)
+            if updated is not None:
+                row = updated
         elif row.kind == "optimization":
-            row = await aggregate_optimization(db, row)
+            updated = await aggregate_optimization(db, row)
+            if updated is not None:
+                row = updated
     return row
 
 
@@ -529,6 +542,8 @@ async def create_walk_forward(
     await db.commit()
     await db.refresh(analysis)
 
+    # 审计行不挂在请求会话上：此处状态早已提交，传 db=db 的话没人再 commit，
+    # 这行会随请求会话一起被回滚掉——审计静默丢失，事后查不到任何人做过什么。
     await audit.record(
         "backtest.walk_forward_create",
         actor=audit.AuditActor(
@@ -539,7 +554,6 @@ async def create_walk_forward(
         target_type="backtest_analysis",
         target_id=str(analysis.id),
         params={"task_id": str(src.id), "folds": payload.folds, "mode": payload.mode},
-        db=db,
     )
     if settings.BACKTEST_ENABLED:
         queue = get_backtest_queue()
@@ -598,6 +612,8 @@ async def create_monte_carlo(
     await db.commit()
     await db.refresh(analysis)
 
+    # 审计行不挂在请求会话上：此处状态早已提交，传 db=db 的话没人再 commit，
+    # 这行会随请求会话一起被回滚掉——审计静默丢失，事后查不到任何人做过什么。
     await audit.record(
         "backtest.monte_carlo_create",
         actor=audit.AuditActor(
@@ -608,7 +624,6 @@ async def create_monte_carlo(
         target_type="backtest_analysis",
         target_id=str(analysis.id),
         params={"task_id": str(task.id), **params},
-        db=db,
     )
     return analysis
 
@@ -668,6 +683,8 @@ async def create_optimization(
     await db.commit()
     await db.refresh(analysis)
 
+    # 审计行不挂在请求会话上：此处状态早已提交，传 db=db 的话没人再 commit，
+    # 这行会随请求会话一起被回滚掉——审计静默丢失，事后查不到任何人做过什么。
     await audit.record(
         "backtest.optimization_create",
         actor=audit.AuditActor(
@@ -683,7 +700,6 @@ async def create_optimization(
             "objective": payload.objective,
             "combos": len(combos),
         },
-        db=db,
     )
     if settings.BACKTEST_ENABLED:
         queue = get_backtest_queue()
@@ -708,7 +724,7 @@ def _portfolio_out(
         symbols=list(row.symbols),
         timeframe=row.timeframe,
         total_deposit=float(row.total_deposit),
-        status=row.status,
+        status=cast("Literal['running', 'completed', 'failed']", row.status),
         params=row.params,
         result=row.result,
         error=row.error,
@@ -815,6 +831,8 @@ async def create_portfolio(
     await db.commit()
     await db.refresh(portfolio)
 
+    # 审计行不挂在请求会话上：此处状态早已提交，传 db=db 的话没人再 commit，
+    # 这行会随请求会话一起被回滚掉——审计静默丢失，事后查不到任何人做过什么。
     await audit.record(
         "backtest.portfolio_create",
         actor=audit.AuditActor(
@@ -830,7 +848,6 @@ async def create_portfolio(
             "timeframe": payload.timeframe,
             "total_deposit": float(portfolio.total_deposit),
         },
-        db=db,
     )
     if settings.BACKTEST_ENABLED:
         queue = get_backtest_queue()
@@ -940,7 +957,10 @@ async def list_trades(
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-    return TradeListResponse(items=list(result.scalars()), total=total)
+    rows = list(result.scalars())
+    return TradeListResponse(
+        items=[BacktestTradeOut.model_validate(r) for r in rows], total=total,
+    )
 
 
 @router.get("/{task_id}/trades.csv")
@@ -1015,7 +1035,11 @@ async def list_logs(
         .limit(page_size)
     )
     truncated = (task.config_snapshot or {}).get("log_dropped", 0) > 0
-    return LogListResponse(items=list(result.scalars()), total=total, truncated=truncated)
+    rows = list(result.scalars())
+    return LogListResponse(
+        items=[BacktestLogOut.model_validate(r) for r in rows],
+        total=total, truncated=truncated,
+    )
 
 
 # ---------------------------------------------------------------------------

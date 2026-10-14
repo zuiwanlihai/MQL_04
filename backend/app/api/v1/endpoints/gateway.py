@@ -37,10 +37,10 @@ def _user_id(current: dict) -> uuid.UUID:
     return uuid.UUID(current["sub"])
 
 
-async def _require_admin(db, current: dict) -> None:
+async def _require_admin(db, current: dict, action: str = "生成配对码") -> None:
     user = await db.get(User, _user_id(current))
     if user is None or (user.role != "admin" and not user.is_superuser):
-        raise HTTPException(status_code=403, detail="权限不足：仅管理员可生成配对码")
+        raise HTTPException(status_code=403, detail=f"权限不足：仅管理员可{action}")
 
 
 @router.post("/pair-codes", response_model=PairCodeOut, status_code=201)
@@ -170,7 +170,14 @@ async def create_node(
     current: CurrentUser,
     db: DBSession,
 ) -> GatewayNodeOut:
-    """Register a node manually — probed immediately (offline on failure)."""
+    """Register a node manually — probed immediately (offline on failure).
+
+    管理员操作：注册表就是「平台自己认可的网关」这份名单，而平台会给名单里的
+    每一个地址送 ``X-Gateway-Key``（心跳每几秒一次）。名单能由任意用户添加，
+    「只发给已注册节点」就等于没有约束——先注册一台自己的主机，再等心跳上门。
+    """
+    await _require_admin(db, current, "注册网关节点")
+
     existing = await db.execute(
         select(GatewayNode).where(
             GatewayNode.host == payload.host, GatewayNode.port == payload.port
@@ -240,8 +247,10 @@ async def delete_node(
 
     Guarded: MT5Account.gateway_node_id is ON DELETE CASCADE, so deleting a
     node would silently unbind every account on it — reject the primary node
-    and any node that still has bound accounts.
+    and any node that still has bound accounts.  Admin-only, like
+    ``create_node``: it is the same trusted-host list.
     """
+    await _require_admin(db, current, "删除网关节点")
     node = await db.get(GatewayNode, node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="网关节点不存在")

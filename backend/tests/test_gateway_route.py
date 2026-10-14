@@ -133,6 +133,10 @@ def test_reconcile_builds_client_per_account_node(client, token, monkeypatch):
         def __init__(self, base_url=None):
             seen_urls.append(base_url or "")
 
+        @classmethod
+        def for_registered_node(cls, base_url=None):
+            return cls(base_url)
+
         async def positions(self, symbol=None, timeout=None):
             return []
 
@@ -246,6 +250,10 @@ def _paper_stub(monkeypatch, *, login_error: bool = False):
     class Stub:
         def __init__(self, base_url=None):
             seen["urls"].append(base_url or "")
+
+        @classmethod
+        def for_registered_node(cls, base_url=None):
+            return cls(base_url)
 
         async def login(self, login, password, server):
             seen["logins"].append((login, password, server))

@@ -52,6 +52,12 @@ class RecordingStub:
         self.logins: list[tuple] = []
         RecordingStub.instances.append(self)
 
+    @classmethod
+    def for_registered_node(cls, base_url: str | None = None) -> RecordingStub:
+        # 桩不区分凭据来源（注册表节点 / 平台默认地址）；「密钥该不该带」由
+        # tests/test_gateway_key_scope.py 对着真实客户端验。
+        return cls(base_url)
+
     async def login(self, login: int, password: str, server: str) -> dict:
         self.logins.append((login, password, server))
         if RecordingStub.unavailable:

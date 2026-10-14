@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, or_, select
@@ -32,6 +33,7 @@ from app.schemas.strategy import (
     StrategyVersionOut,
     TemplateListResponse,
     TemplateOut,
+    TemplateSummaryOut,
     VersionCreate,
     VersionListResponse,
 )
@@ -63,7 +65,9 @@ async def list_templates(current: CurrentUser, db: DBSession) -> TemplateListRes
         )
     )
     rows = list(result.scalars())
-    return TemplateListResponse(items=rows, total=len(rows))
+    return TemplateListResponse(
+        items=[TemplateSummaryOut.model_validate(r) for r in rows], total=len(rows)
+    )
 
 
 @router.get("/templates/{template_id}", response_model=TemplateOut)
@@ -73,7 +77,7 @@ async def get_template(
     tpl = await db.get(StrategyTemplate, template_id)
     if tpl is None:
         raise HTTPException(status_code=404, detail="模板不存在")
-    return tpl
+    return TemplateOut.model_validate(tpl)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +167,7 @@ async def list_strategies(
     )
     items = list(result.scalars())
     return StrategyListResponse(
-        items=items,
+        items=[StrategyOut.model_validate(r) for r in items],
         total=total,
         page=page,
         page_size=page_size,
@@ -231,7 +235,7 @@ async def save_source(
     await db.refresh(strategy)
     return StrategySourceOut(
         source_code=strategy.source_code,
-        updated_at=strategy.updated_at,
+        updated_at=strategy.updated_at if strategy.updated_at is not None else datetime.now(),
         validation=validate_source(strategy.source_code),
     )
 
@@ -261,7 +265,9 @@ async def list_versions(
         .order_by(StrategyVersion.version.desc())
     )
     rows = list(result.scalars())
-    return VersionListResponse(items=rows, total=len(rows))
+    return VersionListResponse(
+        items=[StrategyVersionOut.model_validate(r) for r in rows], total=len(rows)
+    )
 
 
 @router.post(

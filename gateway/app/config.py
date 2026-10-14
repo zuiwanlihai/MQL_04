@@ -21,7 +21,10 @@ class GatewaySettings(BaseSettings):
     # -- HTTP ---------------------------------------------------------------
     GATEWAY_HOST: str = "127.0.0.1"
     GATEWAY_PORT: int = 8090
-    GATEWAY_API_KEY: str = "dev-gateway-key"
+    # 网关访问密钥。**故意不给默认值**：默认值等于写进源码的公开口令，照文档装
+    # 出来的网关会拿它对外服务。留空时启动自检直接拒绝启动
+    # （见 app.security.assert_key_configured），配对流程负责写入随机值。
+    GATEWAY_API_KEY: str = ""
 
     # -- MetaTrader 5 -------------------------------------------------------
     MT5_PATH: str = r"C:\Program Files\MetaTrader 5\terminal64.exe"

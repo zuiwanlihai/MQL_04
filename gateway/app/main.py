@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app import ops
+from app import ops, security
 from app.config import settings
 from app.mt5_client import MT5Error, client
 from app.routes import account, health, market, selfcheck, terminal, trade
@@ -31,6 +31,11 @@ logger = logging.getLogger("gateway")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    # 第一件事就是验密钥：没配好的网关不该先连终端、再开始对外服务。
+    # 未配置时在这里抛 RuntimeError → uvicorn 报 "Application startup failed"
+    # 并以非零码退出，而不是留下一个无鉴权的交易端口。
+    security.assert_key_configured()
+
     logger.info("MT5 gateway starting on %s:%s", settings.GATEWAY_HOST, settings.GATEWAY_PORT)
 
     # -- abnormal-restart detection (state file from the previous run) --

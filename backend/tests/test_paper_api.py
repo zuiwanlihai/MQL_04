@@ -9,6 +9,7 @@ row stays ``pending`` and we assert the pure API/validation/control surface.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -371,3 +372,61 @@ def test_stop_pending_marks_failed(client, token, strategy, account):
 def test_reset_pending_409(client, token, strategy, account):
     rid = client.post(API, json=_body(strategy, account), headers=_auth(token)).json()["id"]
     assert client.post(f"{API}/{rid}/reset", headers=_auth(token)).status_code == 409
+
+
+# ── 成交落库（2.3 超时后的成交泄漏） ────────────────────────────
+
+def _trade_event(ticket: int, **kw) -> dict:
+    ev = {
+        "event": "trade",
+        "ticket": ticket,
+        "direction": "buy",
+        "volume": 0.1,
+        "open_time": 1_760_000_400,
+        "open_price": 1.1,
+        "base_price": 1.1,
+        "close_time": 1_760_004_000,
+        "close_price": 1.1005,
+        "profit": 5.0,
+        "profit_percent": 0.5,
+        "is_forced": False,
+    }
+    ev.update(kw)
+    return ev
+
+
+def test_suspect_flag_from_the_engine_reaches_the_row(client, token, strategy, account):
+    """引擎标出的可疑成交必须一路落到 ``paper_trades.suspect``。
+
+    超时回调里的成交是先于失败判定落库的（``_stream`` 里 ``_flush_rows`` 在失败
+    分支之前），所以这条标记只能在事件上传递——丢了它就等于没标。
+    """
+    rid = client.post(API, json=_body(strategy, account),
+                      headers=_auth(token)).json()["id"]
+
+    async def _run() -> list[tuple[int, bool]]:
+        from sqlalchemy import select
+
+        from app.engine.session import AsyncSessionLocal
+        from app.models import PaperTrade
+        from app.services.paper.manager import PaperManager, _RunHandle
+
+        mgr = PaperManager()
+        mgr._handles[rid] = _RunHandle(
+            run_id=rid, sup=object(), stream_task=None, poll_task=None,
+            dir=Path("."), symbol="EURUSD", timeframe="H1", tf_seconds=TF_SECONDS,
+        )
+        on_event = mgr._on_event(rid)
+        await on_event(_trade_event(1, suspect=True,
+                                    suspect_reason="on_bar() 超出回调时限后被终止"))
+        await on_event(_trade_event(2))  # 正常成交：不得被连坐
+        await mgr._flush_rows(rid)
+
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(PaperTrade).where(PaperTrade.run_id == uuid.UUID(rid))
+                .order_by(PaperTrade.ticket)
+            )).scalars().all()
+            return [(r.ticket, r.suspect) for r in rows]
+
+    assert client.portal.call(_run) == [(1, True), (2, False)]

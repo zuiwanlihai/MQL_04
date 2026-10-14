@@ -12,6 +12,7 @@ Idempotent: re-running for the same day upserts the row.
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
@@ -69,9 +70,11 @@ async def aggregate_day(day: date) -> int:
             (run.id): (run.strategy_id, run.strategy_version or 0) for run in runs
         }
         for pr_id, cnt in risk_rows:
-            key = run_to_version.get(pr_id)
-            if key and key in per_version:
-                per_version[key]["risk"] += cnt
+            if pr_id is None:
+                continue
+            ver_key: tuple[uuid.UUID, int] | None = run_to_version.get(pr_id)
+            if ver_key and ver_key in per_version:
+                per_version[ver_key]["risk"] += cnt
 
         for (strategy_id, version), agg in per_version.items():
             stmt = pg_insert(PaperDailyStats).values(

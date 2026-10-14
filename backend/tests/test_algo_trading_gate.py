@@ -270,6 +270,11 @@ def test_algo_enabled_order_passes_gate(client, token, monkeypatch):
 
     class StubGW:
         def __init__(self, *a, **k) -> None: ...
+
+        @classmethod
+        def for_registered_node(cls, *a, **k):
+            return cls(*a, **k)
+
         async def place_market(self, *a, **k) -> dict:
             return {"success": True, "order": 111, "deal": 222,
                     "price": 1.11, "volume": 0.1}

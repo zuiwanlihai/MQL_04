@@ -22,9 +22,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import CurrentUser, DBSession
 from app.models import AuditLog, User
-from app.schemas.audit import AuditListResponse, AuditVerifyOut
+from app.schemas.audit import AuditListResponse, AuditOut, AuditVerifyOut
 from app.services.alert import emit as alert_emit
-from app.services.audit import AuditActor, verify_chain
+from app.services.audit import AuditActor, verdict, verify_chain
 from app.services.audit import record as audit_record
 
 router = APIRouter()
@@ -107,11 +107,13 @@ async def list_audit_logs(
     )).scalar_one()
     rows = (await db.execute(
         select(AuditLog).where(*conds)
-        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        # 按写入序号排：created_at 同微秒时 uuid4 主键定的先后是随机的，
+        # 「最近一条」会随机跳。
+        .order_by(AuditLog.seq.desc())
         .offset((page - 1) * page_size).limit(page_size)
     )).scalars().all()
     return AuditListResponse(
-        items=list(rows), total=total, page=page, page_size=page_size,
+        items=[AuditOut.model_validate(r) for r in rows], total=total, page=page, page_size=page_size,
         total_pages=max((total + page_size - 1) // page_size, 1),
     )
 
@@ -120,25 +122,49 @@ async def list_audit_logs(
 async def verify_audit_chain(
     current: CurrentUser, db: DBSession, request: Request
 ) -> AuditVerifyOut:
-    """Re-walk the whole hash chain; broken link → critical alert + audit row."""
+    """Re-walk the whole hash chain; anomalies → alert + audit row.
+
+    分叉与篡改分开报：分叉是并发写入的旧缺陷留下的痕迹（内容完好），报
+    critical 会让历史遗留把新篡改淹没在同一个告警里。
+    """
     await _require_admin(db, current)
-    total, broken = await verify_chain()
-    ok = broken == -1
+    total, findings = await verify_chain()
+    kind = verdict(findings)
+    ok = kind == "ok"
+    first = findings[0] if findings else None
+    broken_index = first.index if first else -1
     checked_at = datetime.now(UTC)
     await audit_record(
         "audit_verify", actor=_actor(current, request),
         target_type="system", target_id="audit_chain",
-        params={"total": total, "ok": ok, "broken_index": broken},
+        params={"total": total, "ok": ok, "verdict": kind,
+                "broken_index": broken_index,
+                "findings_total": len(findings),
+                "findings": [{"index": f.index, "seq": f.seq, "kind": f.kind}
+                             for f in findings[:20]]},
         result="success" if ok else "failure",
     )
-    if not ok:
+    if kind == "critical":
         await alert_emit(
             source="audit_chain", level="critical",
-            title=f"审计链校验失败（第 {broken + 1} 条断链）",
-            message=(f"共 {total} 条审计记录，校验发现链在索引 {broken}（0 基）处断裂，"
+            title=(f"审计链校验失败（{len(findings)} 处异常，"
+                   f"首个在第 {broken_index + 1} 条）"),
+            message=(f"共 {total} 条审计记录，校验发现 {len(findings)} 处异常；"
+                     f"第一处在索引 {broken_index}（0 基）：{first.detail if first else ''}。"
                      "可能存在篡改或删除，请立即排查。"),
         )
-    return AuditVerifyOut(total=total, ok=ok, broken_index=broken,
+    elif kind == "fork":
+        await alert_emit(
+            source="audit_chain", level="warn",
+            title=f"审计链存在分叉（{len(findings)} 处，非篡改）",
+            message=(f"共 {total} 条审计记录，校验发现 {len(findings)} 处分叉；"
+                     f"第一处在索引 {broken_index}（0 基）：{first.detail if first else ''}。"
+                     "分叉行自身内容完好，是并发写入的旧缺陷留下的痕迹；"
+                     "请核对时间戳确认是历史遗留，修复之后若再现请立即排查。"),
+        )
+    return AuditVerifyOut(total=total, ok=ok, broken_index=broken_index,
+                          verdict=kind, findings_total=len(findings),
+                          reason=first.detail if first else None,
                           checked_at=checked_at)
 
 
@@ -166,7 +192,9 @@ async def export_audit_logs(
     conds = _filters(start, end, actor_id, action, target_type, target_id, result)
     rows = (await db.execute(
         select(AuditLog).where(*conds)
-        .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+        # 导出的是**链**：顺序必须是写入顺序（seq），否则拿到手的一串哈希
+        # 对不上前一条，看的人会以为记录被人动过。
+        .order_by(AuditLog.seq.asc())
         .limit(_EXPORT_ROWS_MAX)
     )).scalars().all()
 

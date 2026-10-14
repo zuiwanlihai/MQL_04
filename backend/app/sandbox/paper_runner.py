@@ -35,16 +35,17 @@ import random  # noqa: E402
 
 from app.sandbox.paper_engine import PaperEngine  # noqa: E402
 from app.sandbox.payload import load_payload  # noqa: E402
+from app.sandbox.runner_io import RunnerWriter, start_wedge_reaper  # noqa: E402
 
 EXIT_DONE = 0
 EXIT_SAFETY = 2
 EXIT_LOAD_FAILED = 3
 
+_writer = RunnerWriter()
+
 
 def _emit(kind: str, data: dict) -> None:
-    line = json.dumps({"event": kind, **data}, ensure_ascii=False, default=str)
-    sys.stdout.write(line[:262_144] + "\n")
-    sys.stdout.flush()
+    _writer.emit(kind, data)
 
 
 def _emit_all(events) -> dict | None:
@@ -81,12 +82,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--payload", required=True, help="payload directory")
     args = parser.parse_args(argv)
 
+    # 心跳必须早于任何可能挂住的步骤启动，否则父进程会把启动耗时误判成卡死。
+    _writer.start_heartbeat()
+
     payload_dir = pathlib.Path(args.payload)
     payload, bars = load_payload(payload_dir)
     random.seed(payload.seed)
 
     paper = PaperEngine(payload, bars, storage_path=payload_dir / "storage.json")
     paper.restore_storage()
+    start_wedge_reaper(_writer, paper.eng.unresolved_timeout_seconds)
 
     # start: load → on_init → replay startup history
     fail = _emit_all(paper.start())
@@ -120,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit_all(paper.eng._drain())
         elif name == "stop":
             _emit_all(paper.stop(bool(cmd.get("close", True))))
+            _writer.stop_heartbeat()
             sys.stdout.flush()
             return EXIT_DONE
 

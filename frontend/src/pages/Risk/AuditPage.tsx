@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
+  AlertTriangle,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -12,6 +13,7 @@ import { useAuditList, useExportAudit, useVerifyAuditChain } from '@/hooks/useAu
 import { apiError } from '@/lib/api';
 import { relativeTime } from '@/lib/market';
 import { useAuthStore } from '@/store/useAuthStore';
+import type { AuditVerifyResult } from '@/types/api';
 
 const RESULT_STYLES: Record<string, string> = {
   success: 'bg-profit/15 text-profit border-profit/40',
@@ -54,6 +56,24 @@ const ACTION_LABELS: Record<string, string> = {
   audit_verify: '审计链校验',
   audit_export: '审计导出',
 };
+
+// 校验结果分三档：分叉是并发写入的旧缺陷留下的痕迹（内容完好），
+// 和篡改共用一个红色「失败」的话，真正的篡改会被历史遗留磨掉敏感度。
+const VERDICT_STYLES = {
+  ok: { card: 'border-profit/40 bg-profit/5', text: 'text-profit' },
+  fork: { card: 'border-yellow-500/40 bg-yellow-500/10', text: 'text-yellow-400' },
+  critical: { card: 'border-loss/40 bg-loss/10', text: 'text-loss' },
+} as const;
+
+function verdictText(v: AuditVerifyResult): string {
+  if (v.verdict === 'ok') {
+    return `审计链完好（共 ${v.total} 条，校验于 ${relativeTime(v.checked_at)}）`;
+  }
+  if (v.verdict === 'fork') {
+    return `审计链有 ${v.findings_total} 处分叉（首个在第 ${v.broken_index + 1} 条，共 ${v.total} 条）：内容未被改动，来自并发写入的旧缺陷，已记入告警`;
+  }
+  return `审计链校验失败：${v.findings_total} 处异常，首个在第 ${v.broken_index + 1} 条（共 ${v.total} 条），已产生严重告警`;
+}
 
 export default function AuditPage() {
   const user = useAuthStore((s) => s.user);
@@ -119,23 +139,24 @@ export default function AuditPage() {
 
       {/* 校验结果徽章 */}
       {verify.data && (
-        <div
-          className={`card ${
-            verify.data.ok ? 'border-profit/40 bg-profit/5' : 'border-loss/40 bg-loss/10'
-          }`}
-        >
+        <div className={`card ${VERDICT_STYLES[verify.data.verdict].card}`}>
           <div className="card-body flex items-center gap-3 text-sm">
-            {verify.data.ok ? (
+            {verify.data.verdict === 'ok' ? (
               <ShieldCheck className="w-5 h-5 text-profit shrink-0" />
+            ) : verify.data.verdict === 'fork' ? (
+              <AlertTriangle className="w-5 h-5 text-yellow-400 shrink-0" />
             ) : (
               <ShieldX className="w-5 h-5 text-loss shrink-0" />
             )}
-            <span className={verify.data.ok ? 'text-profit' : 'text-loss'}>
-              {verify.data.ok
-                ? `审计链完好（共 ${verify.data.total} 条，校验于 ${relativeTime(verify.data.checked_at)}）`
-                : `审计链校验失败：第 ${verify.data.broken_index + 1} 条断链（共 ${verify.data.total} 条），已产生严重告警`}
+            <span className={VERDICT_STYLES[verify.data.verdict].text}>
+              {verdictText(verify.data)}
             </span>
           </div>
+          {verify.data.reason && verify.data.verdict !== 'ok' && (
+            <div className="card-body pt-0 text-xs text-gray-400">
+              {verify.data.reason}
+            </div>
+          )}
         </div>
       )}
       {(verify.isError || exportCsv.isError || list.isError) && (

@@ -73,9 +73,9 @@ class TickSyncQueue:
                         finished_at=datetime.now(UTC))
             )
             await db.commit()
-            if result.rowcount:
+            if result.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
                 logger.warning("tick sync sweep: %d orphaned running jobs failed",
-                               result.rowcount)
+                               result.rowcount)  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
 
     def enqueue(self, job_id: str) -> None:
         self._queue.put_nowait(str(job_id))
@@ -171,7 +171,7 @@ class TickSyncQueue:
                     index_elements=["symbol", "time_msc"]
                 )
                 result = await db.execute(stmt)
-                inserted += result.rowcount or 0
+                inserted += result.rowcount or 0  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
             await db.commit()
         return inserted
 
@@ -181,7 +181,7 @@ class TickSyncQueue:
         async with AsyncSessionLocal() as db:
             result = await db.execute(delete(TickData).where(TickData.symbol == symbol))
             await db.commit()
-            return result.rowcount or 0
+            return result.rowcount or 0  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
 
 
 _queue: TickSyncQueue | None = None

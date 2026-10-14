@@ -96,6 +96,10 @@ export default function RiskPage() {
     const isRate = fType === 'order_rate_window';
     const windowMinutes = isRate ? Math.round(Number(fWindowMinutes)) : undefined;
     if (isRate && (!windowMinutes || windowMinutes <= 0)) return;
+    // 不选账户 = 全局规则。global 规则对全平台每个账户都生效（后端里 global 与
+    // account/run 是并集），所以只有管理员能建——普通用户在这里就被挡住，不白跑
+    // 一趟 403。
+    if (!accountId && !isAdmin) return;
     const scope = accountId ? 'account' : 'global';
     createRule.mutate(
       {
@@ -112,6 +116,11 @@ export default function RiskPage() {
       { onSuccess: () => setFormOpen(false) },
     );
   }
+
+  // 列表里对非管理员只剩两种规则：自己的，和全局的。全局规则要看得见（它正拦着
+  // 你的单），但改不了——那是全平台的默认风控。后端对此返回 404，所以按钮这里就
+  // 该是灰的，别让用户点出一个「规则不存在」。
+  const canMutate = (r: { scope: string }) => isAdmin || r.scope !== 'global';
 
   // 阈值列展示：连续亏损冷却「3 笔 · 休 4 小时」；时间窗口限频「1 次 · 每 5 分钟」
   const thresholdCell = (r: { type: string; threshold: number; cooldown_minutes?: number | null; window_minutes?: number | null }) => (
@@ -259,10 +268,20 @@ export default function RiskPage() {
               />
             </div>
             <div className="sm:col-span-4 flex items-center gap-2">
-              <button type="button" className="btn-primary" disabled={createRule.isPending} onClick={submitRule}>
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={createRule.isPending || (!accountId && !isAdmin)}
+                onClick={submitRule}
+              >
                 保存（{accountId ? '账户级' : '全局'}）
               </button>
               <button type="button" className="btn-ghost" onClick={() => setFormOpen(false)}>取消</button>
+              {!accountId && !isAdmin && (
+                <span className="text-xs text-gray-500">
+                  全局规则对全平台所有账户生效，仅管理员可建；请先在上方「账户」里选一个自己的账户
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -305,10 +324,10 @@ export default function RiskPage() {
                 <td>
                   <button
                     type="button"
-                    disabled={!canEdit || updateRule.isPending}
+                    disabled={!canEdit || !canMutate(r) || updateRule.isPending}
                     className={`text-xs ${r.enabled ? 'text-profit' : 'text-gray-500'} disabled:cursor-default`}
-                    title={canEdit ? '点击切换启用状态' : ''}
-                    onClick={() => canEdit && updateRule.mutate({ id: r.id, enabled: !r.enabled })}
+                    title={canEdit ? (canMutate(r) ? '点击切换启用状态' : '全局规则仅管理员可改') : ''}
+                    onClick={() => canEdit && canMutate(r) && updateRule.mutate({ id: r.id, enabled: !r.enabled })}
                   >
                     {r.enabled ? '启用' : '停用'}
                   </button>
@@ -319,8 +338,8 @@ export default function RiskPage() {
                     <button
                       type="button"
                       className="text-loss hover:text-loss-light disabled:opacity-50"
-                      disabled={deleteRule.isPending}
-                      title="删除规则"
+                      disabled={deleteRule.isPending || !canMutate(r)}
+                      title={canMutate(r) ? '删除规则' : '全局规则仅管理员可删'}
                       onClick={() => {
                         if (window.confirm('删除该风控规则？操作将记入审计。')) deleteRule.mutate(r.id);
                       }}

@@ -40,6 +40,10 @@ from collections import deque  # noqa: E402
 
 from app.sandbox.live_engine import LiveEngine  # noqa: E402
 from app.sandbox.payload import load_payload  # noqa: E402
+from app.sandbox.runner_io import (  # noqa: E402
+    RunnerWriter,
+    start_wedge_reaper,
+)
 
 EXIT_DONE = 0
 EXIT_SAFETY = 2
@@ -75,14 +79,24 @@ def _read_line() -> dict | None:
 class Transport:
     """JSONL stdout writer + req_id-demultiplexed order RPC (single-threaded)."""
 
-    def __init__(self) -> None:
-        self._inbox: deque[dict] = deque()
+    def __init__(self, writer: RunnerWriter | None = None) -> None:
+        self._inbox: list[dict] = []
+        self._writer = writer or RunnerWriter()
+
+    @property
+    def writer(self) -> RunnerWriter:
+        return self._writer
 
     # ── stdout ───────────────────────────────────────────────────
     def emit(self, kind: str, data: dict) -> None:
-        line = json.dumps({"event": kind, **data}, ensure_ascii=False, default=str)
-        sys.stdout.write(line[:262_144] + "\n")
-        sys.stdout.flush()
+        # 心跳线程会并发写 stdout，必须走同一把锁（见 runner_io）。
+        self._writer.emit(kind, data)
+
+    def start_heartbeat(self) -> None:
+        self._writer.start_heartbeat()
+
+    def stop_heartbeat(self) -> None:
+        self._writer.stop_heartbeat()
 
     # ── order RPC ────────────────────────────────────────────────
     def _take_from_inbox(self, req_id: str) -> dict | None:
@@ -118,7 +132,7 @@ class Transport:
     def next_command(self) -> dict | None:
         while True:
             while self._inbox:
-                m = self._inbox.popleft()
+                m = self._inbox.pop(0)
                 if m.get("cmd"):
                     return m
             msg = _read_line()
@@ -144,13 +158,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--payload", required=True, help="payload directory")
     args = parser.parse_args(argv)
 
+    tp = Transport()
+    # 心跳必须早于任何可能挂住的步骤启动，否则父进程会把启动耗时误判成卡死。
+    tp.start_heartbeat()
+
     payload_dir = pathlib.Path(args.payload)
     payload, bars = load_payload(payload_dir)
     random.seed(payload.seed)
 
-    tp = Transport()
     live = LiveEngine(payload, bars, tp, storage_path=payload_dir / "storage.json")
     live.restore_storage()
+    start_wedge_reaper(tp.writer, live.eng.unresolved_timeout_seconds)
 
     fail = _emit_all(tp, live.start())
     if fail is not None:
@@ -186,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit_all(tp, live.eng._drain())
         elif name == "stop":
             _emit_all(tp, live.stop(bool(cmd.get("close", True))))
+            tp.stop_heartbeat()
             sys.stdout.flush()
             return EXIT_DONE
 

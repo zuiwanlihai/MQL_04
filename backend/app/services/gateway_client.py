@@ -53,14 +53,38 @@ class GatewayTradeNotAllowed(GatewayError):  # noqa: N818 — mirrors sibling na
 
 
 class GatewayClient:
-    """Thin typed wrapper over the gateway's REST routes."""
+    """Thin typed wrapper over the gateway's REST routes.
 
-    def __init__(self, base_url: str | None = None) -> None:
+    凭据是**选择加入**的：``X-Gateway-Key`` 是一把平台级共享密钥（网关侧不做
+    账户级鉴权），拿到它的人可以对每一台网关下单、平仓。所以只有「地址来自
+    平台自己」的客户端才带它：
+
+    * ``GatewayClient()`` —— 平台 .env 里配的那台网关，是自己的；
+    * ``GatewayClient.for_registered_node(url)`` —— ``GatewayNode`` 注册表里的
+      节点，由管理员注册/配对码写入，是自己的；
+    * ``GatewayClient(url)`` —— 传进来的地址（例如用户填的探测地址）**不带
+      任何凭据**。
+
+    缺省是安全的那个方向：忘了用 ``for_registered_node`` 的后果是对方返回
+    401（显眼、可修），而不是密钥被送到别人主机上（无声、不可撤）。
+    """
+
+    def __init__(self, base_url: str | None = None, *, api_key: str | None = None) -> None:
+        if api_key is None and base_url is None:
+            api_key = settings.GATEWAY_API_KEY
         self._client = httpx.AsyncClient(
             base_url=(base_url or settings.GATEWAY_URL).rstrip("/"),
-            headers={"X-Gateway-Key": settings.GATEWAY_API_KEY},
+            headers={"X-Gateway-Key": api_key} if api_key else {},
             timeout=httpx.Timeout(settings.GATEWAY_TIMEOUT_SECONDS, connect=3.0),
         )
+
+    @classmethod
+    def for_registered_node(cls, base_url: str | None = None) -> GatewayClient:
+        """客户端指向 ``GatewayNode`` 注册表里的节点（或平台自配地址）：带密钥。
+
+        ``base_url=None`` 表示「没解析到节点，用平台默认网关」——同样是自己的。
+        """
+        return cls(base_url, api_key=settings.GATEWAY_API_KEY)
 
     # -- lifecycle -----------------------------------------------------------
     async def aclose(self) -> None:

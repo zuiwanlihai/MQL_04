@@ -217,6 +217,47 @@ def test_sync_failure_maps_to_failed_status(
     assert all(c["symbol"] != "XAUUSD" for c in r.json()["items"])
 
 
+def _audit_actions(client: TestClient, target_id: str) -> list[str]:
+    """该目标上留下的审计动作（按写入顺序）。"""
+
+    async def _q() -> list[str]:
+        from sqlalchemy import select
+
+        from app.engine.session import AsyncSessionLocal
+        from app.models import AuditLog
+
+        async with AsyncSessionLocal() as db:
+            return list((await db.execute(
+                select(AuditLog.action).where(AuditLog.target_id == target_id)
+                .order_by(AuditLog.seq)
+            )).scalars().all())
+
+    return client.portal.call(_q)
+
+
+def test_audit_rows_survive_the_request(client: TestClient, gw: list, token: str) -> None:
+    """审计行必须真的落库。
+
+    这两个端点把审计行写进了请求会话（``db=db``）却没人 commit：请求结束时
+    会话只是 close，未提交的事务被回滚——审计行一条不剩。接口照样返回 200，
+    事后却查不到任何人同步过、删除过数据。这里不看返回什么，只看库里有没有。
+    """
+    sym = "AUDITUSD"
+    r = client.post(
+        f"{API}/sync",
+        json={"symbol": sym, "start": T0, "end": T0 + 3600},
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+    _wait_terminal(client, token, r.json()["id"])
+    assert _audit_actions(client, sym) == ["tick.sync_request"], "同步动作没有留痕"
+
+    r = client.delete(f"{API}/{sym}", headers=_auth(token))
+    assert r.status_code == 200
+    assert _audit_actions(client, sym) == ["tick.sync_request", "tick.purge"], \
+        "删除动作没有留痕"
+
+
 def test_purge_symbol(client: TestClient, gw: list, token: str) -> None:
     r = client.post(
         f"{API}/sync",

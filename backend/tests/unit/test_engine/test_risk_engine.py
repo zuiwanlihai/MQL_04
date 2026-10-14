@@ -116,6 +116,31 @@ def test_frequency_limit():
     assert not v.allow and v.rule_type == "max_orders_per_minute"
 
 
+def test_unknown_order_count_fails_closed():
+    """计数取不到时必须拒绝：「不知道」不等于「这一分钟一单没有」。
+
+    手动链路的前置计数来自审计日志查询，DB 抖一下就会失败。旧实现把失败折算
+    成 0，于是限频规则在最需要它的时候恰好不生效——失效方向反了。
+    """
+    v = evaluate(op="buy", symbol="EURUSD", volume=0.1, position_id=None,
+                 run=_run(), account=_acc(), positions=[],
+                 rules=[_rule("max_orders_per_minute", 20)],
+                 symbol_info=SYM, orders_this_minute=None)
+    assert not v.allow
+    assert v.error_code == "RISK_CHECK_UNAVAILABLE", v.error_code
+    assert v.rule_type == "max_orders_per_minute"
+    assert "无法" in v.error_message, v.error_message
+
+
+def test_unknown_order_count_without_the_rule_stays_allowed():
+    """没有规则消费这个计数时不得凭空拦截：那会是一次无谓的误拒。"""
+    v = evaluate(op="buy", symbol="EURUSD", volume=0.1, position_id=None,
+                 run=_run(), account=_acc(), positions=[],
+                 rules=[_rule("max_lot_per_order", 1.0)],
+                 symbol_info=SYM, orders_this_minute=None)
+    assert v.allow is True
+
+
 # ── daily loss / drawdown ──────────────────────────────────────
 
 def test_daily_max_loss_absolute_halts():

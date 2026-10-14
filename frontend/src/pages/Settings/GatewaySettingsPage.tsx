@@ -14,6 +14,7 @@ import {
 } from '@/hooks/useGateway';
 import { apiError } from '@/lib/api';
 import { NODE_STATUS_LABELS } from '@/lib/market';
+import { useAuthStore } from '@/store/useAuthStore';
 
 const NODE_STATUS_STYLES: Record<string, string> = {
   online: 'bg-profit/15 text-profit border-profit/40',
@@ -23,6 +24,11 @@ const NODE_STATUS_STYLES: Record<string, string> = {
 };
 
 export default function GatewaySettingsPage() {
+  // 注册/删除节点是管理员操作：注册表就是「平台认可的网关」名单，平台会给名单里
+  // 每个地址送网关密钥。非管理员只读——按钮藏起来，省得点出一个 403。
+  const user = useAuthStore((s) => s.user);
+  const isAdmin = user?.role === 'admin';
+
   const nodesQuery = useGatewayNodes();
   const nodes = nodesQuery.data?.items ?? [];
   const node = nodes.find((n) => n.is_primary) ?? nodes[0];
@@ -80,9 +86,13 @@ export default function GatewaySettingsPage() {
               <span className="text-xs text-gray-600">共 {nodesQuery.data.total} 个</span>
             )}
           </div>
-          <button type="button" className="btn-primary" onClick={() => setFormOpen((v) => !v)}>
-            <Plus className="w-4 h-4" /> 注册节点
-          </button>
+          {isAdmin ? (
+            <button type="button" className="btn-primary" onClick={() => setFormOpen((v) => !v)}>
+              <Plus className="w-4 h-4" /> 注册节点
+            </button>
+          ) : (
+            <span className="text-xs text-gray-600">注册 / 删除节点需管理员权限</span>
+          )}
         </div>
 
         {formOpen && (
@@ -163,7 +173,7 @@ export default function GatewaySettingsPage() {
                       )}
                     </td>
                     <td className="text-right">
-                      {!n.is_primary && (
+                      {isAdmin && !n.is_primary && (
                         <button
                           type="button"
                           className="text-loss hover:text-loss-light disabled:opacity-50 text-xs"

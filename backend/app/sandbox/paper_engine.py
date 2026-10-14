@@ -114,7 +114,7 @@ class PaperEngine:
             "margin_free": round(acc.free_margin(close), 4),
             "unrealized_pnl": round(acc.unrealized_pnl(close), 4),
             "margin_level": (
-                round(acc.margin_level(close), 4) if acc.margin_level(close) else None
+                round(ml, 4) if (ml := acc.margin_level(close)) is not None else None
             ),
             "last_bar_time": (
                 _iso(int(eng.bars.time[eng.index])) if eng.index >= 0 else None

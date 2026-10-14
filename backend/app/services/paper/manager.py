@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from sdk.errors import ErrorCode
 from sqlalchemy import delete, select, update
 
 from app.config import settings
@@ -43,7 +44,12 @@ from app.sandbox.matching import TF_SECONDS
 from app.sandbox.payload import BacktestPayload, BarArrays, save_payload
 from app.services.backtest.supervisor import (
     TERM_COMPLETED,
+    TERM_STALLED,
     RunnerSupervisor,
+)
+from app.services.fault_state import (  # P0-4 统一故障状态机
+    FaultType,
+    gate_fault,
 )
 from app.services.ea_bridge import (
     registry as ea_registry,
@@ -183,7 +189,7 @@ class PaperManager:
                 .values(status="running", started_at=datetime.now(UTC))
             )
             await db.commit()
-            if not res.rowcount:
+            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
                 return  # cancelled between create and claim
             run = await db.get(PaperRun, uid)
             assert run is not None
@@ -194,7 +200,10 @@ class PaperManager:
             gateway_url = await resolve_gateway(db, run.account_id)
             node = await resolve_node(db, run.account_id)
             node_type = node.type if node is not None else "python"
-            ea_node_id = str(node.id) if node_type == "ea_bridge" else ""
+            ea_node_id = ""
+            if node_type == "ea_bridge":
+                assert node is not None, "ea_bridge node must exist when type matches"
+                ea_node_id = str(node.id)
             creds = (await account_credentials(db, run.account_id)
                      if run.account_id is not None else None)
 
@@ -208,7 +217,7 @@ class PaperManager:
             if rows is None:
                 return  # fail-fast 已落库
         else:
-            client = GatewayClient(gateway_url)
+            client = GatewayClient.for_registered_node(gateway_url)
             try:
                 if creds is not None:
                     login, password, server = creds
@@ -232,13 +241,14 @@ class PaperManager:
                 except GatewayError as exc:
                     await self._fail(run_id, "UNKNOWN_ERROR", f"网关不可达：{exc.detail}")
                     return
-                info = next(
+                sym_info: dict | None = next(
                     (s for s in symbols if s.get("name", "").upper() == run.symbol.upper()),
                     None,
                 )
-                if info is None:
+                if sym_info is None:
                     await self._fail(run_id, "INVALID_SYMBOL", f"网关不存在品种：{run.symbol}")
                     return
+                info = sym_info
                 tf = TF_SECONDS[run.timeframe]
                 need = run.warmup_bars + settings.PAPER_HISTORY_BARS + 1
                 # 用「最新 N 根」端点而非日历时间窗口：休市/周末期间固定回看窗口
@@ -282,7 +292,8 @@ class PaperManager:
         h = _RunHandle(
             run_id=run_id,
             sup=RunnerSupervisor(
-                run_id, payload_dir, module="app.sandbox.paper_runner"
+                run_id, payload_dir, module="app.sandbox.paper_runner",
+                stall_timeout=float(settings.SANDBOX_STALL_TIMEOUT_SECONDS),
             ),
             stream_task=asyncio.create_task(
                 self._stream(run_id), name=f"paper-stream-{run_id[:8]}"
@@ -436,6 +447,24 @@ class PaperManager:
             if result.outcome == TERM_COMPLETED:
                 run.status = "stopped"
                 run.stopped_at = now
+            elif result.outcome == TERM_STALLED:
+                # 卡死杀进程时不会有 fail 事件——父侧自己得把原因说清楚，
+                # 否则用户只看得到「沙箱进程异常退出」。
+                run.status = "failed"
+                run.stopped_at = now
+                run.error_code = ErrorCode.RESOURCE_TIMEOUT.value
+                run.error_message = (
+                    f"策略进程连续 {settings.SANDBOX_STALL_TIMEOUT_SECONDS} 秒无任何响应"
+                    f"（含心跳），已判定卡死并终止；常见原因是回调中的死循环或长时间阻塞。"
+                    f"\n{result.stderr_tail[-1500:]}"
+                )[:8000]
+                # P0-4 结构化故障输出：模拟策略卡死
+                await gate_fault(
+                    fault_type=FaultType.STRATEGY_TIMEOUT,
+                    action_taken="判定卡死并终止沙箱进程",
+                    run_id=run.id,
+                    detail=run.error_message,
+                ).emit(db=db)
             else:
                 fail = h.fail or {}
                 run.status = "failed"
@@ -444,6 +473,16 @@ class PaperManager:
                 msg = str(fail.get("message") or "沙箱进程异常退出")
                 tb = str(fail.get("traceback") or "")
                 run.error_message = (msg + (f"\n{tb[-1500:]}" if tb else ""))[:8000]
+                # P0-4 结构化故障输出：模拟策略崩溃 / 非法 import / 其他异常
+                ft = FaultType.STRATEGY_CRASHED
+                if run.error_code in ("ILLEGAL_IMPORT", "SANDBOX_VIOLATION"):
+                    ft = FaultType.STRATEGY_ILLEGAL_IMPORT
+                await gate_fault(
+                    fault_type=ft,
+                    action_taken=f"策略进程异常退出（code={run.error_code}）",
+                    run_id=run.id,
+                    detail=run.error_message,
+                ).emit(db=db)
             db.add(run)
             await db.commit()
         if result.outcome != TERM_COMPLETED:
@@ -471,12 +510,14 @@ class PaperManager:
                     # EB-3 起订单在真实 demo 账户执行）；沙箱模拟账户仅用于
                     # 信号回放，不写 run 行。
                     if ts := event.get("last_bar_time"):
-                        h.last_ts = max(h.last_ts, int(_dt(ts).timestamp()))
+                        if dt := _dt(ts):
+                            h.last_ts = max(h.last_ts, int(dt.timestamp()))
                 else:
                     h.account = event  # _write_account 的镜像源（balance/equity/positions）
                     ts = event.get("last_bar_time")
                     if ts:
-                        h.last_ts = max(h.last_ts, int(_dt(ts).timestamp()))
+                        if dt := _dt(ts):
+                            h.last_ts = max(h.last_ts, int(dt.timestamp()))
                     h.pending_equity.append({
                         "time": ts,
                         "equity": float(event.get("equity", 0.0)),
@@ -579,10 +620,10 @@ class PaperManager:
                     ticket=int(t["ticket"]),
                     direction=str(t["direction"]),
                     volume=_dec(t["volume"], 4),
-                    open_time=_dt(t["open_time"]),
+                    open_time=_dt(t["open_time"]) or datetime(1970, 1, 1, tzinfo=UTC),
                     open_price=_dec(t["open_price"]),
                     base_price=_dec(t["base_price"]),
-                    close_time=_dt(t["close_time"]),
+                    close_time=_dt(t["close_time"]) or datetime(1970, 1, 1, tzinfo=UTC),
                     close_price=_dec(t["close_price"]),
                     profit=_dec(t["profit"], 4),
                     profit_percent=_dec(t["profit_percent"], 6),
@@ -592,6 +633,8 @@ class PaperManager:
                     slippage_cost=_dec(t.get("slippage_cost", 0.0)),
                     comment=str(t.get("comment", ""))[:200],
                     is_forced=bool(t.get("is_forced", False)),
+                    # 引擎在熔断判定时打上的标记（见 engine._quarantine）。
+                    suspect=bool(t.get("suspect", False)),
                 ))
             h.logs.clear()
             h.trades.clear()
@@ -603,7 +646,7 @@ class PaperManager:
         h = self._handles.get(run_id)
         assert h is not None
         is_ea = h.node_type == "ea_bridge"
-        client = None if is_ea else GatewayClient(h.gateway_url or None)
+        client = None if is_ea else GatewayClient.for_registered_node(h.gateway_url or None)
         try:
             while True:
                 await asyncio.sleep(settings.PAPER_POLL_SECONDS)
@@ -637,6 +680,7 @@ class PaperManager:
                             (res.get("payload") or {}).get("bars") or [],
                         )
                     else:
+                        assert client is not None, "client must exist when not is_ea"
                         rows = await client.rates_range(
                             h.symbol, h.timeframe, h.last_ts + 1, end,
                         )
@@ -669,7 +713,7 @@ class PaperManager:
         h = self._handles.get(run_id)
         assert h is not None
         is_ea = h.node_type == "ea_bridge"
-        client = None if is_ea else GatewayClient(h.gateway_url or None)
+        client = None if is_ea else GatewayClient.for_registered_node(h.gateway_url or None)
         try:
             while True:
                 await asyncio.sleep(settings.TICK_POLL_SECONDS)
@@ -689,6 +733,7 @@ class PaperManager:
                         # 去重/跳过仍由 last_tick_msc 游标兜底。
                         raw = fetch_ea_buffer_ticks(h.ea_node_id, h.symbol)
                     else:
+                        assert client is not None, "client must exist when not is_ea"
                         raw = await fetch_gateway_ticks(
                             client, h.symbol, start_s, now_s,
                         )
@@ -723,7 +768,7 @@ class PaperManager:
                 .values(status="paused")
             )
             await db.commit()
-            if not res.rowcount:
+            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
                 row = await db.scalar(select(PaperRun.status).where(
                     PaperRun.id == _uuid(run_id)))
                 return row or "not_found"
@@ -740,7 +785,7 @@ class PaperManager:
                 .values(status="running")
             )
             await db.commit()
-            if not res.rowcount:
+            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
                 row = await db.scalar(select(PaperRun.status).where(
                     PaperRun.id == _uuid(run_id)))
                 return row or "not_found"
@@ -777,6 +822,13 @@ class PaperManager:
                 run.stopped_at = datetime.now(UTC)
                 db.add(run)
                 await db.commit()
+                # P0-4 结构化故障输出：启动前被手动取消
+                await gate_fault(
+                    fault_type=FaultType.STARTUP_FAILED,
+                    action_taken="启动前被用户取消",
+                    run_id=run.id,
+                    detail="启动前被停止",
+                ).emit(db=db)
                 return "failed"
             await db.execute(
                 update(PaperRun)
@@ -870,6 +922,20 @@ class PaperManager:
                 run.stopped_at = datetime.now(UTC)
                 db.add(run)
                 await db.commit()
+                # P0-4 结构化故障输出：通用失败路径
+                ft = FaultType.STRATEGY_CRASHED
+                if code == "CANCELLED":
+                    ft = FaultType.STARTUP_FAILED
+                elif code in ("ILLEGAL_IMPORT", "SANDBOX_VIOLATION"):
+                    ft = FaultType.STRATEGY_ILLEGAL_IMPORT
+                elif code == ErrorCode.RESOURCE_TIMEOUT.value:
+                    ft = FaultType.STRATEGY_TIMEOUT
+                await gate_fault(
+                    fault_type=ft,
+                    action_taken=f"策略失败（code={code}）",
+                    run_id=run.id,
+                    detail=message,
+                ).emit(db=db)
 
 
 def _chunks(seq: list, size: int) -> list[list]:

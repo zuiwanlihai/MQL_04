@@ -30,6 +30,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
+from sdk.errors import ErrorCode
 from sqlalchemy import delete, select, update
 
 from app.config import settings
@@ -42,7 +43,15 @@ from app.services.audit import AuditActor
 from app.services.audit import record as audit_record
 from app.services.backtest.supervisor import (
     TERM_COMPLETED,
+    TERM_STALLED,
     RunnerSupervisor,
+)
+from app.services.fault_state import (  # P0-4 统一故障状态机
+    FaultRecord,
+    FaultState,
+    FaultType,
+    gate_fault,
+    state_transition,
 )
 from app.services.gateway_client import (
     GatewayClient,
@@ -220,7 +229,7 @@ class LiveManager:
                 .values(status="running", started_at=datetime.now(UTC))
             )
             await db.commit()
-            if not res.rowcount:
+            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
                 return  # cancelled between create and claim
             run = await db.get(LiveRun, uid)
             assert run is not None
@@ -236,7 +245,10 @@ class LiveManager:
             gateway_url = await resolve_gateway(db, run.account_id)
             node = await resolve_node(db, run.account_id)
             node_type = node.type if node is not None else "python"
-            ea_node_id = str(node.id) if node_type == "ea_bridge" else ""
+            ea_node_id = ""
+            if node_type == "ea_bridge":
+                assert node is not None, "ea_bridge node must exist when type matches"
+                ea_node_id = str(node.id)
             creds = await account_credentials(db, run.account_id)
             node_id = (await db.execute(
                 select(MT5Account.gateway_node_id).where(MT5Account.id == run.account_id)
@@ -277,7 +289,7 @@ class LiveManager:
             )
             return
 
-        client = GatewayClient(gateway_url)
+        client = GatewayClient.for_registered_node(gateway_url)
         try:
             login, password, server = creds
             try:
@@ -345,7 +357,8 @@ class LiveManager:
         h = _RunHandle(
             run_id=run_id,
             sup=RunnerSupervisor(
-                run_id, payload_dir, module="app.sandbox.live_runner"
+                run_id, payload_dir, module="app.sandbox.live_runner",
+                stall_timeout=float(settings.SANDBOX_STALL_TIMEOUT_SECONDS),
             ),
             stream_task=asyncio.create_task(
                 self._stream(run_id), name=f"live-stream-{run_id[:8]}"
@@ -471,6 +484,27 @@ class LiveManager:
             if result.outcome == TERM_COMPLETED:
                 run.status = "stopped"
                 run.stopped_at = now
+            elif result.outcome == TERM_STALLED:
+                # 卡死杀进程时不会有 fail 事件——父侧自己得把原因说清楚，
+                # 否则用户只看得到「沙箱进程异常退出」。实盘下这通常意味着
+                # 有持仓而策略已失控，所以文案要显式提示人工核对。
+                run.status = "failed"
+                run.stopped_at = now
+                run.error_code = ErrorCode.RESOURCE_TIMEOUT.value
+                run.error_message = (
+                    f"策略进程连续 {settings.SANDBOX_STALL_TIMEOUT_SECONDS} 秒无任何响应"
+                    f"（含心跳），已判定卡死并终止；请人工核对持仓与挂单，"
+                    f"必要时在对账页确认收敛。"
+                    f"\n{result.stderr_tail[-1500:]}"
+                )[:8000]
+                # P0-4 结构化故障输出：策略卡死
+                await gate_fault(
+                    fault_type=FaultType.STRATEGY_TIMEOUT,
+                    action_taken="判定卡死并终止沙箱进程",
+                    run_id=run.id,
+                    account_id=run.account_id,
+                    detail=run.error_message,
+                ).emit(db=db)
             else:
                 fail = h.fail or {}
                 run.status = "failed"
@@ -478,7 +512,28 @@ class LiveManager:
                 run.error_code = str(fail.get("code") or "UNKNOWN_ERROR")[:32]
                 msg = str(fail.get("message") or "沙箱进程异常退出")
                 tb = str(fail.get("traceback") or "")
+                if run.error_code == ErrorCode.RESOURCE_TIMEOUT.value:
+                    # 回调被熔断打断 ≠ 券商那边什么都没发生：此前发出的单子不会
+                    # 因为策略失败而撤销，而账户镜像停在打断前那一刻。不写这句，
+                    # 用户会把「运行失败」读成「没有仓位」——那正是失控的起点。
+                    # （成交本身不需要标记：live_trades 来自券商成交回报，是既成
+                    # 事实；可疑的是账户镜像的时效性。）
+                    msg += (
+                        "\n注意：策略是在回调中途被终止的，此前发出的订单不会随之撤销。"
+                        "账户镜像可能落后于券商实际状态，请在对账页核对持仓与挂单。"
+                    )
                 run.error_message = (msg + (f"\n{tb[-1500:]}" if tb else ""))[:8000]
+                # P0-4 结构化故障输出：策略崩溃 / 非法 import / 其他运行时异常
+                ft = FaultType.STRATEGY_CRASHED
+                if run.error_code in ("ILLEGAL_IMPORT", "SANDBOX_VIOLATION"):
+                    ft = FaultType.STRATEGY_ILLEGAL_IMPORT
+                await gate_fault(
+                    fault_type=ft,
+                    action_taken=f"策略进程异常退出（code={run.error_code}）",
+                    run_id=run.id,
+                    account_id=run.account_id,
+                    detail=run.error_message,
+                ).emit(db=db)
             db.add(run)
             await db.commit()
         if result.outcome != TERM_COMPLETED:
@@ -523,7 +578,7 @@ class LiveManager:
         网关异常时返回 None → 冷却规则跳过本次评估，不阻断下单路径。
         """
         try:
-            client = GatewayClient(h.gateway_url or None)
+            client = GatewayClient.for_registered_node(h.gateway_url or None)
             try:
                 end = int(time.time())
                 return await client.deals(end - 14 * 86400, end)
@@ -589,7 +644,7 @@ class LiveManager:
             ):
                 # 优先持仓登记表（按票号直查，不依赖终端历史同步）
                 try:
-                    rc_client = GatewayClient(h.gateway_url or None)
+                    rc_client = GatewayClient.for_registered_node(h.gateway_url or None)
                     try:
                         closed_trades, registry_open_times = await sync_position_registry(
                             rc_client, str(h.account_id), h.positions
@@ -638,6 +693,19 @@ class LiveManager:
                 "error_code": "UNKNOWN_ERROR",
                 "error_message": f"下单中转异常：{exc}",
             })
+            # P0-4 外层 RPC 中转异常：覆盖 _execute_at_gateway 内部未捕获的异常
+            # （如风控代码 bug、ticket 注册异常等），与内层 FaultRecord 不重复
+            try:
+                async with AsyncSessionLocal() as db:
+                    await gate_fault(
+                        fault_type=FaultType.ORDER_FAILED,
+                        action_taken=f"下单中转异常：{exc}",
+                        run_id=run_id,
+                        account_id=h.account_id,
+                        detail=f"op={op} symbol={symbol} {exc}",
+                    ).emit(db=db, level="critical")
+            except Exception:  # noqa: BLE001 — emit 失败不能阻断订单流
+                logger.exception("order fault emit (outer) failed: run_id=%s", run_id)
         finally:
             h.busy = False
         await h.sup.send(result)
@@ -652,7 +720,7 @@ class LiveManager:
             "commission": 0.0, "error_code": None, "error_message": None,
             "account": self._mirror_payload(h),
         }
-        client = GatewayClient(h.gateway_url or None)
+        client = GatewayClient.for_registered_node(h.gateway_url or None)
         try:
             if op in ("buy", "sell"):
                 gw = await client.place_market(
@@ -668,7 +736,7 @@ class LiveManager:
             else:
                 out["error_code"] = "INVALID_SYMBOL"
                 out["error_message"] = f"未知操作：{op}"
-                return out
+                gw = {"success": False}  # 占位，让下面的 if gw.get("success") 跳过
             if gw.get("success"):
                 out.update({
                     "success": True,
@@ -700,6 +768,11 @@ class LiveManager:
             await self._refresh_mirror(h, client)
             await client.aclose()
             out["account"] = self._mirror_payload(h)
+
+        # P0-4 订单失败统一结构化输出：一个 emit 覆盖所有 5 种失败分支
+        # （券商拒单 / 网关超时 / 风控拦截 / 网关连接失败 / 无效操作）
+        if not out["success"]:
+            await self._emit_order_fault(h, op, symbol, out)
         return out
 
     @staticmethod
@@ -713,6 +786,44 @@ class LiveManager:
         if retcode in (10004, 10019):
             return "REQUOTE"
         return "UNKNOWN_ERROR"
+
+    async def _emit_order_fault(
+        self, h: _RunHandle, op: str, symbol: str, out: dict,
+    ) -> None:
+        """P0-4 订单失败统一 FaultRecord emit。
+
+        按 error_code 区分故障级别：风控拦截 = critical，超时/未知 = warn，
+        券商业务拒单（保证金/停盘/手数）= warn（这些是正常失败，不是系统故障）。
+        """
+        code = str(out.get("error_code") or "UNKNOWN_ERROR")
+        level = "warn"
+        action = f"订单操作 {op} {symbol} 失败"
+        if code == "RISK_BLOCKED":
+            level = "critical"
+            action = f"风控拦截：{out.get('error_message', '')}"
+        elif code == "UNKNOWN_ERROR" and "超时" in str(out.get("error_message", "")):
+            action = "下单结果未知（网关超时），已转对账收敛"
+        elif code == "MARKET_CLOSED":
+            action = "市场关闭，订单被券商拒绝"
+        elif code == "INSUFFICIENT_MARGIN":
+            action = "保证金不足，订单被券商拒绝"
+        elif code == "INVALID_VOLUME":
+            action = "手数不合法，订单被券商拒绝"
+        elif code == "REQUOTE":
+            action = "价格已变，需要 requote 重试"
+
+        async with AsyncSessionLocal() as db:
+            try:
+                await gate_fault(
+                    fault_type=FaultType.ORDER_FAILED,
+                    action_taken=action,
+                    run_id=h.run_id,
+                    account_id=h.account_id,
+                    detail=f"op={op} symbol={symbol} error_code={code} "
+                           f"error_message={out.get('error_message', '')}",
+                ).emit(db=db, level=level)
+            except Exception:  # noqa: BLE001 — emit 失败不能阻断订单流
+                logger.exception("order fault emit failed: run_id=%s", h.run_id)
 
     async def _record_deal(
         self, h: _RunHandle, op: str, gw: dict, req: dict | None = None,
@@ -857,7 +968,8 @@ class LiveManager:
     async def _refresh_mirror(self, h: _RunHandle, client: GatewayClient | None) -> None:
         own = client is None
         if own:
-            client = GatewayClient(h.gateway_url or None)
+            client = GatewayClient.for_registered_node(h.gateway_url or None)
+        assert client is not None, "client must be set after _refresh_mirror init"
         try:
             acc = await client.account()
             positions = await client.positions()
@@ -949,7 +1061,7 @@ class LiveManager:
     async def _poll(self, run_id: str) -> None:
         h = self._handles.get(run_id)
         assert h is not None
-        client = GatewayClient(h.gateway_url or None)
+        client = GatewayClient.for_registered_node(h.gateway_url or None)
         try:
             while True:
                 await asyncio.sleep(settings.LIVE_POLL_SECONDS)
@@ -1039,7 +1151,7 @@ class LiveManager:
             "kind": "log", "level": "error",
             "message": (
                 f"K线-报价一致性校验失败(第{h.sanity_rejects}次)："
-                f"bar[{_dt(bar_time).strftime('%H:%M')}] {low:.2f}~{high:.2f} "
+                f"bar[{datetime.fromtimestamp(bar_time, tz=UTC).strftime('%H:%M')}] {low:.2f}~{high:.2f} "
                 f"与最新报价 {bid:.2f} 脱离(容差±{tol:.2f})，"
                 f"已拒收本批 {len(fresh)} 根K线，不喂给策略引擎"
             ),
@@ -1121,7 +1233,7 @@ class LiveManager:
         h = self._handles.get(run_id)
         assert h is not None
         is_ea = h.node_type == "ea_bridge"
-        client = None if is_ea else GatewayClient(h.gateway_url or None)
+        client = None if is_ea else GatewayClient.for_registered_node(h.gateway_url or None)
         try:
             while True:
                 await asyncio.sleep(settings.TICK_POLL_SECONDS)
@@ -1143,6 +1255,7 @@ class LiveManager:
                         # 去重/跳过仍由 last_tick_msc 游标兜底。
                         raw = fetch_ea_buffer_ticks(h.ea_node_id, h.symbol)
                     else:
+                        assert client is not None, "client must exist when not is_ea"
                         raw = await fetch_gateway_ticks(
                             client, h.symbol, start_s, now_s,
                         )
@@ -1177,7 +1290,7 @@ class LiveManager:
                 .values(status="paused")
             )
             await db.commit()
-            if not res.rowcount:
+            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
                 row = await db.scalar(select(LiveRun.status).where(
                     LiveRun.id == _uuid(run_id)))
                 return row or "not_found"
@@ -1194,7 +1307,7 @@ class LiveManager:
                 .values(status="running")
             )
             await db.commit()
-            if not res.rowcount:
+            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
                 row = await db.scalar(select(LiveRun.status).where(
                     LiveRun.id == _uuid(run_id)))
                 return row or "not_found"
@@ -1296,7 +1409,7 @@ class LiveManager:
     # ── real close-all helpers (stop-with-close / Kill / risk) ──
 
     async def _gateway_close_all(self, h: _RunHandle) -> None:
-        client = GatewayClient(h.gateway_url or None)
+        client = GatewayClient.for_registered_node(h.gateway_url or None)
         try:
             positions = await client.positions()
             for p in positions or []:
@@ -1353,6 +1466,14 @@ class LiveManager:
             "人工复核后恢复。",
             level="critical", account_id=account_id, run_id=uid,
         )
+        # P0-4 结构化故障输出：降级
+        await gate_fault(
+            fault_type=FaultType.DEMOTED,
+            action_taken="撤销实盘资格，回退为仅可模拟",
+            run_id=uid,
+            account_id=account_id,
+            detail=reason,
+        ).emit()
 
     async def kill_switch(self, run_id: str | None = None) -> None:
         """Close every position of the given run (or all live runs) and stop."""
@@ -1362,6 +1483,13 @@ class LiveManager:
             if h is not None:
                 await self._gateway_close_all(h)
             await self.stop(rid, close_positions=False)
+            # P0-4 结构化故障输出：kill switch（原来没有审计/告警）
+            if h is not None:
+                await gate_fault(
+                    fault_type=FaultType.KILL_SWITCH,
+                    action_taken="强制清仓并停止策略",
+                    run_id=rid,
+                ).emit()
 
     def spawn_kill_all(self, run_ids: list[str]) -> None:
         """Fire-and-forget Kill Switch: real close + stop every listed run.

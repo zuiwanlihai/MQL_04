@@ -109,6 +109,16 @@ class Settings(BaseSettings):
     SANDBOX_CALLBACK_TIMEOUT_BACKTEST: int = Field(default=5, ge=1)
     SANDBOX_CALLBACK_TIMEOUT_LIVE: int = Field(default=1, ge=1)
     SANDBOX_ON_INIT_TIMEOUT: int = Field(default=60, ge=10)
+    # 父侧兜底：长驻 runner 每 HEARTBEAT 秒写一行心跳，父进程连续 STALL 秒
+    # 一行都没收到（连心跳都没有）就判定卡死并杀掉进程树。这覆盖子进程内熔断
+    # 管不到的情况（回调霸占 GIL、卡在不返回的 C 调用里）。STALL 必须显著大于
+    # HEARTBEAT，否则一次调度抖动就会误杀健康的实盘进程。
+    SANDBOX_RUNNER_HEARTBEAT_SECONDS: int = Field(default=5, ge=1)
+    SANDBOX_STALL_TIMEOUT_SECONDS: int = Field(default=60, ge=10)
+    # 子进程内兜底：回调熔断触发后，异步异常若在这个宽限期内仍未交回控制权
+    # （回调卡在不返回的 C 调用里），runner 自行结束进程。留一点余量是必要的
+    # ——刚触发就硬退出会白白丢掉本可以正常上报的失败原因。
+    SANDBOX_WEDGE_GRACE_SECONDS: int = Field(default=10, ge=1)
 
     # -- Backtest queue (M4) ---------------------------------------------------
     BACKTEST_ENABLED: bool = Field(default=True)

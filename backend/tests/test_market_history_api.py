@@ -298,29 +298,43 @@ def test_sync_gateway_unavailable(client: TestClient, token: str, gw) -> None:
     assert any("不可达" in (i["last_error"] or "") for i in cov["items"])
 
 
-def test_delete_coverage_and_audit(client: TestClient, token: str, gw,
-                                   monkeypatch: pytest.MonkeyPatch) -> None:
-    import app.api.v1.endpoints.market_history as ep
+def _audit_actions(client: TestClient, target_id: str) -> list[str]:
+    """该目标上留下的审计动作（按写入顺序）。"""
 
-    audit_calls: list[str] = []
+    async def _q() -> list[str]:
+        from sqlalchemy import select
 
-    async def fake_record(action: str, **kwargs):
-        audit_calls.append(action)
-        return None
+        from app.engine.session import AsyncSessionLocal
+        from app.models import AuditLog
 
-    monkeypatch.setattr(ep.audit, "record", fake_record)
+        async with AsyncSessionLocal() as db:
+            return list((await db.execute(
+                select(AuditLog.action).where(AuditLog.target_id == target_id)
+                .order_by(AuditLog.seq)
+            )).scalars().all())
 
+    return client.portal.call(_q)
+
+
+def test_delete_coverage_and_audit(client: TestClient, token: str, gw) -> None:
+    """删除追踪要留痕——留痕得查库，不能只查「有没有调用」。
+
+    这个用例原来把 ``audit.record`` 替换成假函数、只断言调用发生：恰好把出问题
+    的那一段换掉了。删追踪的审计行写在请求会话里没人 commit，请求结束就随会话
+    一起回滚——调用当然发生过，库里却什么都没有。查库才看得见这件事。
+    """
     sym = _sym()
     client.post(f"{API}/probe", json={"symbol": sym, "timeframe": "H1"},
                 headers=_auth(token))
     r = client.delete(f"{API}/coverage/{sym}/H1", headers=_auth(token))
     assert r.status_code == 200
     assert r.json() == {"symbol": sym, "timeframe": "H1", "removed": True}
-    assert audit_calls == ["market_history.untrack"]
+    assert _audit_actions(client, sym) == ["market_history.untrack"]
 
     cov = client.get(f"{API}/coverage", headers=_auth(token)).json()
     assert all(i["symbol"] != sym for i in cov["items"])
 
-    # 重复删除 → 404
+    # 重复删除 → 404（且不再留痕）
     r2 = client.delete(f"{API}/coverage/{sym}/H1", headers=_auth(token))
     assert r2.status_code == 404
+    assert _audit_actions(client, sym) == ["market_history.untrack"]

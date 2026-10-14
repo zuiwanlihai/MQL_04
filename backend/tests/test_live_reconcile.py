@@ -31,7 +31,14 @@ def stub() -> StubGW:
     import app.services.live.reconcile as rec_mod
 
     orig = rec_mod.GatewayClient
-    rec_mod.GatewayClient = lambda *a, **k: stub
+
+    def _make(*a, **k):
+        return stub
+
+    # 被测代码走 GatewayClient.for_registered_node(...)：替代品要能应答，
+    # 否则用例会红在「接口不匹配」上，而不是红在真正要验的对账逻辑上。
+    _make.for_registered_node = _make
+    rec_mod.GatewayClient = _make
     yield stub
     rec_mod.GatewayClient = orig
 
@@ -107,6 +114,27 @@ def _uid(client, token) -> str:
 
     return jwt.decode(token, settings.JWT_SECRET_KEY,
                       algorithms=[settings.JWT_ALGORITHM])["sub"]
+
+
+def _promote(client, token, role: str = "admin") -> None:
+    """把 token 对应的用户提成 role。
+
+    本文件这两个用例在验「平台的」风控/告警：global 规则改的是全平台默认，平台
+    级告警（如 kill_switch）没有归属人。2.7 之后两者都归管理员，所以这里显式
+    提权——不提的话，跑不跑得通取决于这个用户是不是库里第一个注册的。
+    """
+    from sqlalchemy import update
+
+    from app.engine.session import AsyncSessionLocal
+    from app.models import User
+
+    uid = uuid.UUID(_uid(client, token))
+
+    async def _up() -> None:
+        async with AsyncSessionLocal() as db:
+            await db.execute(update(User).where(User.id == uid).values(role=role))
+            await db.commit()
+    client.portal.call(_up)
 
 
 # ── reconcile ──────────────────────────────────────────────────
@@ -213,6 +241,9 @@ def test_close_all_and_stop_demotes(client, token, stub):
 def test_alerts_list_and_read(client, token, stub):
     from app.services.alert import emit as alert_emit
 
+    # kill_switch 是平台级告警（无归属账户/运行）：已读归管理员（2.7）。
+    _promote(client, token)
+
     async def _emit():
         return await alert_emit("kill_switch", "测试告警", "内容", level="error")
     row = client.portal.call(_emit)
@@ -257,6 +288,9 @@ def test_unfreeze_requires_admin_confirm(client, token, stub):
 
 
 def test_rules_crud_and_audit(client, token):
+    # 重点是 CRUD + 审计留痕，不是「谁能建全局规则」；scope=global 只是省掉建账户。
+    # global 归管理员（2.7），所以这里提权，让用例验的仍是它自己那件事。
+    _promote(client, token)
     r = client.post(f"{API}/rules", json={
         "scope": "global", "type": "max_lot_per_order", "threshold": 0.5,
         "action": "reject", "note": "全局单笔上限"}, headers=_auth(token))

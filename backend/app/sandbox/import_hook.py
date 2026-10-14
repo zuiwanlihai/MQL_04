@@ -88,7 +88,7 @@ def _importer_module_name() -> Optional[str]:
     while f is not None:
         name = f.f_globals.get("__name__", "")
         if not name or name.startswith(skip):
-            f = f.f_back
+            f = f.f_back  # type: ignore[assignment]  # FrameType.f_back is Optional in stub
             continue
         return name
     return None
@@ -208,7 +208,7 @@ def _make_guard_view(real: ModuleType, forbidden: frozenset[str]) -> _ModuleView
             )
         return getattr(real, name)
 
-    view.__getattr__ = _getattr  # type: ignore[attr-defined]
+    view.__getattr__ = _getattr  # type: ignore[method-assign]  # ModuleType base has __getattr__
     return view
 
 
@@ -269,14 +269,14 @@ def _scoped_datetime_view() -> _ModuleView:
     view = _ModuleView("datetime")
     view.__doc__ = _real.__doc__
     view.__file__ = _real.__file__
-    view.date = _guarded(_real.date)
-    view.time = _guarded(_real.time)
-    view.datetime = _guarded(_real.datetime)
-    view.timedelta = _real.timedelta
-    view.timezone = _real.timezone
-    view.tzinfo = _real.tzinfo
-    view.MINYEAR = _real.MINYEAR
-    view.MAXYEAR = _real.MAXYEAR
+    view.date = _guarded(_real.date)  # type: ignore[attr-defined]  # dynamic on _ModuleView
+    view.time = _guarded(_real.time)  # type: ignore[attr-defined]
+    view.datetime = _guarded(_real.datetime)  # type: ignore[attr-defined]
+    view.timedelta = _real.timedelta  # type: ignore[attr-defined]
+    view.timezone = _real.timezone  # type: ignore[attr-defined]
+    view.tzinfo = _real.tzinfo  # type: ignore[attr-defined]
+    view.MINYEAR = _real.MINYEAR  # type: ignore[attr-defined]
+    view.MAXYEAR = _real.MAXYEAR  # type: ignore[attr-defined]
 
     _extra = set(dir(_real)) - set(vars(view)) - forbidden
     for attr in _extra:
@@ -290,7 +290,7 @@ def _scoped_datetime_view() -> _ModuleView:
             )
         return getattr(_real, name)
 
-    view.__getattr__ = _getattr  # type: ignore[attr-defined]
+    view.__getattr__ = _getattr  # type: ignore[method-assign]  # ModuleType base has __getattr__
     _scoped_dt_view = view
     return view
 
@@ -315,5 +315,5 @@ def uninstall_all() -> None:
     """Remove the finder and restore every patched sys.modules entry."""
     uninstall_import_finder()
     for name, original in _originals.items():
-        sys.modules[name] = original
+        sys.modules[name] = original  # type: ignore[assignment]  # _originals.values() is object
     _originals.clear()

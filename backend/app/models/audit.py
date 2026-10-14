@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import BigInteger, Index, String
+from sqlalchemy import BigInteger, Identity, Index, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,6 +30,13 @@ class AuditLog(BaseModel, kw_only=True):
         Index("ix_audit_logs_target", "target_type", "target_id"),
     )
 
+    seq: Mapped[int] = mapped_column(
+        BigInteger, Identity(always=False), unique=True, nullable=False,
+        init=False, sort_order=-90,
+        comment="插入顺序 = 链的遍历顺序。id 是 uuid4、created_at 只有微秒"
+                "精度，两者都排不出稳定的先后，而哈希链的校验顺序错一步就"
+                "会被读成「有人改了审计」。",
+    )
     ts_ms: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0,
         comment="UTC millisecond timestamp (M3 ⑤ time contract).",

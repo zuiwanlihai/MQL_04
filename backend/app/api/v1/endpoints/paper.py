@@ -38,9 +38,11 @@ from app.schemas.paper import (
     LogListResponse,
     PaperCreate,
     PaperListResponse,
+    PaperLogOut,
     PaperRunDetailOut,
     PaperRunOut,
     PaperStopRequest,
+    PaperTradeOut,
     TradeListResponse,
 )
 from app.services.gateway_route import probe_active_account_type
@@ -254,7 +256,7 @@ async def list_paper_runs(
     )
     items = list(result.scalars())
     return PaperListResponse(
-        items=items, total=total, page=page, page_size=page_size,
+        items=[PaperRunOut.model_validate(r) for r in items], total=total, page=page, page_size=page_size,
         total_pages=max(math.ceil(total / page_size), 1),
     )
 
@@ -266,13 +268,13 @@ async def list_paper_runs(
 @router.get("/{run_id}", response_model=PaperRunDetailOut)
 async def get_paper_run(
     run_id: uuid.UUID, current: CurrentUser, db: DBSession
-) -> PaperRun:
+) -> PaperRunDetailOut:
     run = await _get_owned_run(db, run_id, current)
-    # 动态附加：子进程 ctx.storage 快照（storage.json），供前端网格线等可视化
-    run.strategy_state = _read_strategy_state(
+    detail = PaperRunDetailOut.model_validate(run)
+    detail.strategy_state = _read_strategy_state(
         Path(settings.PAPER_RUNTIME_DIR), str(run_id)
-    )  # type: ignore[attr-defined]
-    return run
+    )
+    return detail
 
 
 @router.get("/{run_id}/trades", response_model=TradeListResponse)
@@ -296,7 +298,9 @@ async def list_trades(
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-    return TradeListResponse(items=list(result.scalars()), total=total)
+    return TradeListResponse(
+        items=[PaperTradeOut.model_validate(r) for r in result.scalars()], total=total
+    )
 
 
 @router.get("/{run_id}/logs", response_model=LogListResponse)
@@ -327,7 +331,9 @@ async def list_logs(
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-    return LogListResponse(items=list(result.scalars()), total=total)
+    return LogListResponse(
+        items=[PaperLogOut.model_validate(r) for r in result.scalars()], total=total
+    )
 
 
 # ---------------------------------------------------------------------------

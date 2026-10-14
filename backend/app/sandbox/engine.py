@@ -19,6 +19,9 @@ wire.
 
 from __future__ import annotations
 
+import ctypes
+import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -67,6 +70,137 @@ class EngineEvent:
 
 class CallbackTimeoutError(Exception):
     pass
+
+
+class _CallbackInterrupt(Exception):  # noqa: N818 — 内部哨兵，非“错误类型”
+    """看门狗线程投递的中断信号（内部用，不携带消息）。
+
+    ``PyThreadState_SetAsyncExc`` 只接受异常**类**：CPython 3.14 起传实例会让
+    解释器直接抛 ``SystemError: ... is not a BaseException subclass``，而类是按
+    无参构造实例化的。所以消息留给 ``_call`` 在翻译成
+    :class:`CallbackTimeoutError` 时补——那里才知道最外层回调的名字与预算。
+    """
+
+
+# 看门狗轮询间隔：回调执行期间盯紧一点（决定熔断的时间精度），空闲时拉长，
+# 免得长时间 paper/live 运行无谓地唤醒线程。
+_FUSE_POLL_ACTIVE = 0.02
+_FUSE_POLL_IDLE = 0.25
+
+
+class _CallbackFuse:
+    """最外层策略回调的墙钟预算。
+
+    ``place_order`` 会同步回调进策略（``on_order``），所以 ``on_bar`` 里的每一次
+    下单都在 ``_call`` 内部再套一层 ``_call``。预算属于**最外层**那一次：嵌套
+    调用既不重新计时、也不撤销计时。旧实现里内层 ``finally`` 无条件执行
+    ``signal.setitimer(ITIMER_REAL, 0)``，等价于「只要下过单，之后的代码就再
+    没有熔断」——这在 Linux 上同样成立，不只是 Windows 缺 ``SIGALRM`` 的问题。
+
+    中断手段是看门狗线程 + ``PyThreadState_SetAsyncExc``：对纯 Python 字节码
+    循环必定生效，且不依赖 POSIX 信号，因此 Windows 与其它平台走**同一条**代码
+    路径（``signal`` 方案恰好在 Windows 上完全失效，也就是生产平台）。
+
+    安全性靠一把锁：看门狗**持锁**完成「确认仍在外层回调内 → 投递异常」，
+    ``disarm()`` 也要拿同一把锁。于是唯一可能的交错是异常被投递进 ``disarm()``
+    所在的 ``finally`` 块——仍在 ``_call`` 的栈帧内，不会漂移到下一个回调。
+
+    管不到的情况：回调卡在不释放 GIL 的 C 代码里（例如灾难性回溯的 ``re``），
+    看门狗线程拿不到 GIL。那由父进程 ``RunnerSupervisor`` 兜底杀进程。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = False
+        self._owner_tid: Optional[int] = None
+        self._deadline = 0.0
+        self._label = ""
+        self._timeout = 0.0
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._fired_at: Optional[float] = None
+        # 可观测计数：测试据此断言「一次最外层回调恰好一装一卸」。
+        self.armed = 0
+        self.disarmed = 0
+        self.fired = 0
+
+    def arm(self, label: str, timeout: float) -> None:
+        """为一次最外层回调装上引信。``timeout <= 0`` 表示不设预算。"""
+        if timeout <= 0:
+            return
+        self._ensure_watchdog()
+        with self._lock:
+            self._label = label
+            self._timeout = float(timeout)
+            self._deadline = time.monotonic() + float(timeout)
+            self._owner_tid = threading.get_ident()
+            self._active = True
+            self._fired_at = None
+            self.armed += 1
+
+    def disarm(self) -> None:
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
+            self._owner_tid = None
+            self._fired_at = None
+            self.disarmed += 1
+
+    def unresolved_seconds(self) -> float:
+        """熔断已触发、但控制权仍未交回——过去了多少秒；正常时为 0。
+
+        投递的是**异步异常**，只有回到字节码边界才生效。回调若卡在不返回的 C
+        调用里（例如灾难性回溯的 ``re``），熔断会一直悬着：异常投不进去，回调
+        也返回不了。runner 据此判定「熔断已经救不回来了」，改为硬退出整个进程。
+        """
+        with self._lock:
+            if self._fired_at is None:
+                return 0.0
+            return max(0.0, time.monotonic() - self._fired_at)
+
+    def shutdown(self) -> None:
+        self._stop.set()
+
+    # -- 看门狗 -----------------------------------------------------------
+    def _ensure_watchdog(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._watch, name="sandbox-callback-fuse", daemon=True
+        )
+        self._thread.start()
+
+    def _watch(self) -> None:
+        while not self._stop.is_set():
+            self._stop.wait(
+                _FUSE_POLL_ACTIVE if self._active else _FUSE_POLL_IDLE
+            )
+            with self._lock:
+                if not self._active or time.monotonic() < self._deadline:
+                    continue
+                owner = self._owner_tid
+                # 只投递一次；disarm() 随后会把 _active 清掉。
+                self._deadline = float("inf")
+                self._fired_at = time.monotonic()
+                self.fired += 1
+                self._interrupt(owner)
+
+    @staticmethod
+    def _interrupt(tid: Optional[int]) -> None:
+        """在 ``tid`` 线程的下一个字节码边界抛出 :class:`_CallbackInterrupt`。"""
+        if tid is None:
+            return
+        try:
+            modified = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(tid), ctypes.py_object(_CallbackInterrupt)
+            )
+        except Exception:  # noqa: BLE001 — 投递失败由 _call 的耗时兜底检查接管
+            return
+        if modified > 1:  # 打中了多个线程状态，按官方建议撤销
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(tid), ctypes.c_void_p(0)
+            )
 
 
 class BacktestEngine:
@@ -119,6 +253,8 @@ class BacktestEngine:
         self._balance: list[float] = []
         self._progress_pct = -1
         self._module: Optional[dict] = None
+        self._call_depth = 0  # >0 ⇒ 当前是嵌套回调（on_order 在 on_bar 里）
+        self._fuse = _CallbackFuse()
 
     # ── event helpers (used by ctx + engine internals) ─────────
 
@@ -335,38 +471,92 @@ class BacktestEngine:
         return module_dict
 
     def _call(self, fn_name: str, *args, timeout: float) -> None:
+        """调用一个策略回调，并按**最外层**预算熔断。
+
+        嵌套调用（``on_order`` 由 ``place_order`` 同步触发）不改动引信，因此
+        外层剩余的执行时间仍受同一个 deadline 约束；超时预算按「一次用户回调」
+        计，而不是按「一次函数进入」计。
+        """
         fn = self._module.get(fn_name) if self._module else None
         if fn is None:
             return
-        import signal
-        import threading
-        import time
-
+        outermost = self._call_depth == 0
+        self._call_depth += 1
         start = time.perf_counter()
-        use_alarm = (
-            timeout > 0
-            and hasattr(signal, "SIGALRM")
-            and threading.current_thread() is threading.main_thread()
-        )
-        if use_alarm:
-            def _on_alarm(signum, frame):  # noqa: ANN001
-                raise CallbackTimeoutError(
-                    f"{fn_name}() 回调执行超过 {timeout:.0f}s，被强制中断"
-                )
-
-            old = signal.signal(signal.SIGALRM, _on_alarm)
-            signal.setitimer(signal.ITIMER_REAL, timeout)
+        # 本回调产出的事件在它返回前都压在 _out 尾部（引擎单线程，_drain() 只在
+        # run 循环里发生），所以这个游标就是「这次回调的产出」的边界。
+        mark = len(self._out) if outermost else 0
         try:
-            fn(*args)
-            elapsed = time.perf_counter() - start
-            if elapsed > timeout:
+            if outermost:
+                self._fuse.arm(fn_name, timeout)
+            try:
+                fn(*args)
+            except _CallbackInterrupt:
+                # 预算属于最外层回调，标签也只有它知道；嵌套层原样上抛。
+                if not outermost:
+                    raise
                 raise CallbackTimeoutError(
-                    f"{fn_name}() 回调耗时 {elapsed:.2f}s 超过上限 {timeout:.0f}s"
-                )
+                    f"{fn_name}() 回调执行超过 {timeout:g}s，被强制中断"
+                    f"{self._suspect_note(self._quarantine(mark, fn_name))}"
+                ) from None
+            finally:
+                if outermost:
+                    self._fuse.disarm()
+            if outermost:
+                # 看门狗没赶上（或预算 <= 0）时的兜底：事后比对耗时。
+                elapsed = time.perf_counter() - start
+                if timeout > 0 and elapsed > timeout:
+                    raise CallbackTimeoutError(
+                        f"{fn_name}() 回调耗时 {elapsed:.2f}s 超过上限 {timeout:g}s"
+                        f"{self._suspect_note(self._quarantine(mark, fn_name))}"
+                    )
         finally:
-            if use_alarm:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, old)
+            self._call_depth -= 1
+
+    def _quarantine(self, mark: int, fn_name: str) -> int:
+        """把超时回调里**已经产生**的成交标记为可疑，返回笔数——绝不回滚。
+
+        超时判定必然滞后：回调只有交回控制权（或被打断）时才可能被判超时，那时
+        它的下单早已执行完毕。实盘里那是券商已经成交的既成事实，删掉记录只会让
+        账对不上；标记则让用户、对账流程和风控都看得见这几笔不可信。
+
+        ``mark`` 之后的事件都属于本次回调（见 ``_call`` 里的游标注释）。
+        """
+        n = 0
+        for ev in self._out[mark:]:
+            if ev.kind != "trade":
+                continue
+            ev.data["suspect"] = True
+            ev.data["suspect_reason"] = (
+                f"{fn_name}() 超出回调时限后被终止，该成交产生于被打断的回调内，"
+                f"需人工核对"
+            )
+            n += 1
+        return n
+
+    @staticmethod
+    def _suspect_note(n: int) -> str:
+        return f"；本次回调内已产生的 {n} 笔成交已标记为可疑" if n else ""
+
+    def unresolved_timeout_seconds(self) -> float:
+        """熔断已触发但控制权仍未交回，已经过去多少秒；正常时为 0。
+
+        runner 用它判断「回调熔断已经救不回来」，进而硬退出整个进程——见
+        :func:`app.sandbox.runner_io.start_wedge_reaper`。
+        """
+        return self._fuse.unresolved_seconds()
+
+    def _call_stop(self, reason: str) -> None:
+        """尽力而为地执行 ``on_stop``；失败或超时都不得掩盖真正的失败原因。"""
+        try:
+            self._call(
+                "on_stop", self.ctx, reason,
+                timeout=self.payload.callback_timeout_seconds,
+            )
+        except CallbackTimeoutError as exc:
+            self.emit_log("error", f"on_stop() 被超时熔断：{exc}", kind="system")
+        except Exception as exc:  # noqa: BLE001 — 收尾回调不允许再抛
+            self.emit_log("warn", f"on_stop() 执行失败：{exc}", kind="system")
 
     def _call_on_order(self, order: OrderResult) -> None:
         prev = self.phase
@@ -424,6 +614,12 @@ class BacktestEngine:
     # ── main loop ──────────────────────────────────────────────
 
     def run(self) -> Iterator[EngineEvent]:
+        try:
+            yield from self._run_impl()
+        finally:
+            self._fuse.shutdown()  # 回收看门狗线程
+
+    def _run_impl(self) -> Iterator[EngineEvent]:
         n = len(self.bars)
         try:
             self._load_strategy()
@@ -486,11 +682,7 @@ class BacktestEngine:
 
         # end of run: forced close at final bar
         yield from self._force_close_at_last_bar()
-        try:
-            self._call("on_stop", self.ctx, "completed",
-                       timeout=self.payload.callback_timeout_seconds)
-        except Exception:
-            pass
+        self._call_stop("completed")
         yield from self._drain()
 
         yield EngineEvent("done", {"report": self._build_report()})
@@ -587,13 +779,8 @@ class BacktestEngine:
     ) -> Iterator[EngineEvent]:
         self._halted = True
         if call_stop and self._module is not None:
-            try:
-                self.phase = "stop"
-                fn = self._module.get("on_stop")
-                if callable(fn):
-                    fn(self.ctx, f"failed: {code}")
-            except Exception:
-                pass
+            self.phase = "stop"
+            self._call_stop(f"failed: {code}")
         self.emit_log("error", f"回测终止 [{code}]：{message}", kind="system")
         yield from self._drain()
         yield EngineEvent("fail", {

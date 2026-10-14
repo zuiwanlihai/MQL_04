@@ -90,6 +90,7 @@ async def probe_and_upsert(
     own = client is None
     if own:
         client = _new_client()
+    assert client is not None, "client must be set after _new_client or caller-provided"
     try:
         data = await client.probe_history(
             symbol, timeframe, timeout=settings.MARKET_HISTORY_PROBE_TIMEOUT
@@ -157,6 +158,7 @@ async def backfill(
         finally:
             await client.aclose()
 
+        row: MarketDataRange | None
         try:
             row = await probe_and_upsert(db, symbol, timeframe)
         except GatewayError as exc:

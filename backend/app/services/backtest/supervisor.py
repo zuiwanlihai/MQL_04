@@ -24,11 +24,12 @@ import sys
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, cast
 
 import psutil
 
 from app.config import PROJECT_ROOT, settings
+from app.sandbox.runner_io import HEARTBEAT_EVENT
 
 logger = logging.getLogger("mt5quant.backtest.supervisor")
 
@@ -44,6 +45,10 @@ TERM_CANCELLED = "cancelled"
 TERM_TIMEOUT = "timeout"
 TERM_RESOURCE = "resource"
 TERM_CRASH = "crash"
+# Child stopped producing output — not even heartbeats — while it should be
+# alive.  Only reachable when ``stall_timeout`` is set (long-lived paper/live
+# runs, which pass ``timeout=None`` and would otherwise never be killed).
+TERM_STALLED = "stalled"
 
 OnEvent = Callable[[dict], Awaitable[None]]
 
@@ -81,6 +86,12 @@ class RunnerSupervisor:
     ``app.sandbox.paper_runner``.  For paper runs pass ``timeout=None`` —
     the process must not be killed by the backtest wall-clock cap; control
     commands go to its stdin via :meth:`send`.
+
+    Because ``timeout=None`` also removes the *only* kill switch, long-lived
+    runs pass ``stall_timeout`` as well: the child heartbeats on stdout from a
+    thread that does not run strategy code (see
+    :mod:`app.sandbox.runner_io`), so "nothing at all for N seconds" is an
+    unambiguous hang rather than a quiet market.
     """
 
     def __init__(
@@ -88,13 +99,34 @@ class RunnerSupervisor:
         task_id: str,
         payload_dir: Path,
         module: str = "app.sandbox.runner",
+        stall_timeout: Optional[float] = None,
     ) -> None:
         self.task_id = task_id
         self.payload_dir = payload_dir
         self.module = module
+        self.stall_timeout = stall_timeout
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._killed_reason: Optional[str] = None
         self._cancel_requested = False
+
+    def _poll_interval(self) -> float:
+        """读管道时的等待间隔。
+
+        默认 5s 足够；一旦启用卡死判定，检测精度就受这个间隔限制，所以按
+        ``stall_timeout`` 的尺度缩短——否则设 30s 阈值却要等 35s 才发现。
+        """
+        if self.stall_timeout is None:
+            return 5.0
+        return max(0.25, min(5.0, self.stall_timeout / 4))
+
+    def _stalled(self, idle_seconds: float) -> bool:
+        if self.stall_timeout is None or idle_seconds <= self.stall_timeout:
+            return False
+        logger.warning(
+            "task %s 连续 %.1fs 无任何输出（含心跳，阈值 %.0fs）— 判定卡死，杀进程树",
+            self.task_id, idle_seconds, self.stall_timeout,
+        )
+        return True
 
     async def send(self, cmd: dict) -> bool:
         """Write one JSONL control command to the child's stdin and flush.
@@ -169,6 +201,8 @@ class RunnerSupervisor:
         """
         if timeout is _DEFAULT:
             timeout = float(settings.BACKTEST_TIMEOUT_SECONDS)
+        # sentinel 检查后 timeout 只能是 float 或 None；cast 绕过 object 类型声明
+        _timeout: float | None = cast(float | None, timeout)
         stderr_path = self.payload_dir / "runner_stderr.log"
         stderr_file = open(stderr_path, "wb")  # noqa: SIM115 — closed in finally
         env = {
@@ -199,30 +233,39 @@ class RunnerSupervisor:
         result = SuperviseResult(outcome=TERM_COMPLETED)
         rss_task = asyncio.create_task(self._rss_watch())
         deadline = (
-            None if timeout is None
-            else asyncio.get_running_loop().time() + timeout
+            None if _timeout is None
+            else asyncio.get_running_loop().time() + _timeout
         )
         try:
             assert self._proc.stdout is not None
             loop = asyncio.get_running_loop()
+            last_line_at = loop.time()
             while True:
-                remaining = 5.0 if deadline is None else deadline - loop.time()
-                if remaining <= 0:
-                    self._killed_reason = TERM_TIMEOUT
-                    self._kill_tree()
-                    break
+                wait_for = self._poll_interval()
+                if deadline is not None:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        self._killed_reason = TERM_TIMEOUT
+                        self._kill_tree()
+                        break
+                    wait_for = min(wait_for, remaining)
                 try:
                     line = await asyncio.wait_for(
-                        self._proc.stdout.readline(), timeout=min(remaining, 5.0)
+                        self._proc.stdout.readline(), timeout=wait_for
                     )
                 except asyncio.TimeoutError:
                     if self._cancel_requested:
                         self._killed_reason = TERM_CANCELLED
                         self._kill_tree()
                         break
+                    if self._stalled(loop.time() - last_line_at):
+                        self._killed_reason = TERM_STALLED
+                        self._kill_tree()
+                        break
                     continue
                 if not line:
                     break  # stdout EOF — child is finishing
+                last_line_at = loop.time()
                 if len(line) > STREAM_LIMIT - 1024:
                     logger.warning("task %s: oversized event line dropped", self.task_id)
                     continue
@@ -233,6 +276,8 @@ class RunnerSupervisor:
                         "task %s: non-JSON stdout line: %.200r", self.task_id, line
                     )
                     continue
+                if event.get("event") == HEARTBEAT_EVENT:
+                    continue  # 传输层保活，不是引擎事件
                 result.events.append(event)
                 await on_event(event)
             try:
@@ -260,6 +305,8 @@ class RunnerSupervisor:
             return TERM_RESOURCE
         if reason == TERM_TIMEOUT:
             return TERM_TIMEOUT
+        if reason == TERM_STALLED:
+            return TERM_STALLED
         if exit_code == EXIT_DONE:
             return TERM_COMPLETED
         if exit_code in (EXIT_SAFETY, EXIT_LOAD_FAILED):
