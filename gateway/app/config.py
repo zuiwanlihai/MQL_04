@@ -39,6 +39,10 @@ class GatewaySettings(BaseSettings):
     TRADE_ALLOWED_LOGINS: str = ""
     # 单笔最大允许滑点（points）
     TRADE_MAX_DEVIATION: int = 20
+    # P1-A1: 幂等去重 TTL（秒）。相同幂等键的重复请求在 TTL 内直接返回缓存结果，
+    # 不重复下单。Gateway 重启后 cache 清空——此时 MT5 terminal 仍是 source of truth，
+    # 下游（LiveManager reconcile + positions_get 二次收敛）会兜底。
+    IDEMPOTENCY_TTL_SECONDS: float = 300.0
 
     # -- History management (M2 数据中心) --------------------------------------
     # 探测终端本地 K 线范围的分页大小与上限
