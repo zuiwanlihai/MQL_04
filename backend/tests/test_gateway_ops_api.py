@@ -123,11 +123,13 @@ def test_abnormal_restart_alerts_once_per_event(client, monkeypatch):
         return _R()
 
     # P0-4: 生产代码走 gate_fault().emit() → 内部延迟 import alert/audit 模块
-    # monkeypatch 模块本身的函数，确保延迟 import 也能拿到 mock
-    import app.services.alert as _alert_mod
-    import app.services.audit as _audit_mod
-    monkeypatch.setattr(_alert_mod, "emit", fake_emit)
-    monkeypatch.setattr(_audit_mod, "record", fake_audit)
+    # 用 pytest monkeypatch 字符串路径跨模块替换，确保延迟 import 也生效
+    monkeypatch.setattr(
+        "app.services.alert.emit", fake_emit, raising=False,
+    )
+    monkeypatch.setattr(
+        "app.services.audit.record", fake_audit, raising=False,
+    )
 
     async def _run():
         from app.engine.session import AsyncSessionLocal
