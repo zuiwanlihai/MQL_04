@@ -74,6 +74,5 @@ __all__ = [
     "TickData",
     "TickSyncJob",
     "User",
-    "UserKlineCache",
     "UserSession",
 ]
