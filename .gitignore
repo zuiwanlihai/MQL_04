@@ -69,6 +69,24 @@ Desktop.ini
 $RECYCLE.BIN/
 Icon?
 
+# Windows reserved device names — `$null | Out-File NUL` on PowerShell creates
+# a file literally named "NUL" that git then chokes on with "short read while
+# indexing NUL / unable to index file 'NUL'".  Block them flat.
+NUL
+nul
+AUX
+aux
+PRN
+prn
+CON
+con
+COM1
+com1
+COM2
+com2
+LPT1
+lpt1
+
 # ──────────── Docker ────────────
 *.log
 docker-compose.override.yml

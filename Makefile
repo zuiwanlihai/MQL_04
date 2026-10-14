@@ -2,6 +2,14 @@
 # Makefile
 # MT5 Web Quantitative Trading Platform
 # ============================
+#
+# ⚠️ LEGACY — CI uses Windows native (pip install -e .), Docker path is
+#            UNTESTED since P0+P2-3 cleanup.  The compose files still
+#            exist below for reference, but contain references (celery
+#            worker, redis service) that are no longer part of the app.
+#            Use the Windows-native `backend/run.ps1` / `frontend/` scripts
+#            as the primary dev path.  Do NOT delete the Docker files —
+#            they may be re-enabled if the deployment target changes.
 
 SHELL := /bin/bash
 COMPOSE := docker compose -f docker/docker-compose.yml

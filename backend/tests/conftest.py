@@ -127,7 +127,7 @@ def _test_database():
 def client(_test_database):
     from app.main import app
 
-    # Context manager runs the lifespan (init_db / init_redis) and keeps all
+    # Context manager runs the lifespan (init_db) and keeps all
     # requests on a single event loop.
     with TestClient(app) as test_client:
         yield test_client

@@ -2,6 +2,17 @@
 # Docker Compose - Development Stack
 # MT5 Web Quantitative Trading Platform
 # ============================
+#
+# ⚠️ LEGACY — CI runs Windows-native (pip install -e .).  This compose file
+#            has NOT been tested since P2-3 removed Redis/Celery from the
+#            Python app: the `redis`, `celery_worker`, and `celery_beat`
+#            services below are now **dead** — the app no longer connects
+#            to them and there is no celery_app module to launch.
+#
+#            Primary dev path: Windows native (`backend/run.ps1`,
+#            `frontend/` npm run).  Do NOT delete these files yet — if
+#            the deployment target shifts to Docker/K8s they may need to
+#            be re-enabled (after re-adding the infra).
 
 version: "3.9"
 
