@@ -26,22 +26,20 @@ import asyncio
 import logging
 import shutil
 import time
-import uuid as uuid_mod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 from sdk.errors import ErrorCode
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, update
 
 from app.config import settings
 from app.engine.session import AsyncSessionLocal
 from app.models import PaperLog, PaperRun, PaperTrade
 from app.sandbox.matching import TF_SECONDS
-from app.sandbox.payload import BacktestPayload, BarArrays, save_payload
+from app.sandbox.payload import BacktestPayload, save_payload
 from app.services.backtest.supervisor import (
     TERM_COMPLETED,
     TERM_STALLED,
@@ -67,30 +65,19 @@ from app.services.gateway_route import (
     resolve_gateway,
     resolve_node,
 )
-from app.services.run_base import BaseRunManager
+from app.services.run_base import (
+    _ACCOUNT_WRITE_INTERVAL,
+    _FLUSH_ROWS,
+    BaseRunManager,
+    _dec,
+    _dt,
+    _make_singleton,
+    _select_history,
+    _uuid,
+)
 from app.services.strategy_validator import has_callback
-from app.services.tick_feed import fetch_ea_buffer_ticks, fetch_gateway_ticks
 
 logger = logging.getLogger("mt5quant.paper.manager")
-
-_FLUSH_ROWS = 200
-_ACCOUNT_WRITE_INTERVAL = 2.0  # seconds between run-row mirror writes
-
-
-def _uuid(s: str) -> uuid_mod.UUID:
-    return uuid_mod.UUID(s)
-
-
-def _dec(v: object, places: int = 8) -> Decimal:
-    return Decimal(str(round(float(v), places)))  # type: ignore[arg-type]
-
-
-def _dt(epoch_or_iso: object) -> Optional[datetime]:
-    if epoch_or_iso is None:
-        return None
-    if isinstance(epoch_or_iso, (int, float)):
-        return datetime.fromtimestamp(int(epoch_or_iso), tz=UTC)
-    return datetime.fromisoformat(str(epoch_or_iso))
 
 
 @dataclass
@@ -127,6 +114,9 @@ class _RunHandle:
 
 
 class PaperManager(BaseRunManager[_RunHandle]):
+    kind = "paper"
+    run_model = PaperRun
+
     async def startup_sweep(self) -> None:
         """Mark rows orphaned by a backend restart as failed."""
         now = datetime.now(UTC)
@@ -143,22 +133,8 @@ class PaperManager(BaseRunManager[_RunHandle]):
             )
             await db.commit()
 
-    async def shutdown(self) -> None:
-        for rid in list(self._handles):
-            h = self._handles.get(rid)
-            if h is None:
-                continue
-            h.sup.request_cancel()
-            for t in (h.stream_task, h.poll_task, h.tick_task):
-                if t is not None:
-                    t.cancel()
-        deadline = time.monotonic() + 10.0
-        while self._handles and time.monotonic() < deadline:
-            await asyncio.sleep(0.1)
-        self._handles.clear()
-        logger.info("paper manager stopped")
-
-    # active_count() inherited from BaseRunManager
+    # shutdown / pause / resume / reset_anchor / _reclaim / active_count
+    # are inherited from BaseRunManager (run_base.py).
 
     # ── start / spawn ──────────────────────────────────────────
 
@@ -258,7 +234,7 @@ class PaperManager(BaseRunManager[_RunHandle]):
                 f"网关无 {run.symbol} {run.timeframe} 历史数据，无法启动虚拟下单",
             )
             return
-        arrays = _rows_to_arrays(rows)
+        arrays = self._rows_to_arrays(rows)
         payload = self._build_payload(
             run, info, float(info.get("spread", 0) or 0),
             has_on_tick=has_callback(run.source_code, "on_tick"),
@@ -695,106 +671,21 @@ class PaperManager(BaseRunManager[_RunHandle]):
             if client is not None:  # EA 分支无网关客户端
                 await client.aclose()
 
-    # ── tick poll task (on_tick feed, SDK v1.1.0) ──────────────
+    # ── tick poll task ─────────────────────────────────────────
+    # _tick_poll() itself now lives on BaseRunManager (run_base.py); the only
+    # per-subclass difference is which module's GatewayClient builds the feed
+    # client — hence this hook.  It must stay in THIS module so that tests
+    # patching ``app.services.paper.manager.GatewayClient`` keep working
+    # (call-time name lookup has to happen here, not in run_base).
 
-    async def _tick_poll(self, run_id: str) -> None:
-        h = self._handles.get(run_id)
-        assert h is not None
-        is_ea = h.node_type == "ea_bridge"
-        client = None if is_ea else GatewayClient.for_registered_node(h.gateway_url or None)
-        try:
-            while True:
-                await asyncio.sleep(settings.TICK_POLL_SECONDS)
-                cur = self._handles.get(run_id)
-                if cur is not h:
-                    return  # handle replaced/removed
-                if not h.child_live or h.paused.is_set() or h.stopping:
-                    continue  # warmup replay / paused / stopping → no ticks
-                if not is_ea:
-                    now_s = int(time.time())
-                    start_s = h.last_tick_msc // 1000
-                    if now_s <= start_s:
-                        continue  # same second — nothing new to fetch
-                try:
-                    if is_ea:
-                        # EA 桥节点：读注册表缓冲（EA sync 推入），
-                        # 去重/跳过仍由 last_tick_msc 游标兜底。
-                        raw = fetch_ea_buffer_ticks(h.ea_node_id, h.symbol)
-                    else:
-                        assert client is not None, "client must exist when not is_ea"
-                        raw = await fetch_gateway_ticks(
-                            client, h.symbol, start_s, now_s,
-                        )
-                except GatewayError as exc:
-                    logger.warning(
-                        "paper %s tick poll failed: %s", run_id, exc.detail
-                    )
-                    continue  # 休市/网关离线容错：降频重试
-                fresh = [r for r in raw if int(r[0]) > h.last_tick_msc]
-                if not fresh:
-                    continue
-                for chunk in _chunks(fresh, settings.TICK_MAX_ROWS_PER_SEND):
-                    ok = await h.sup.send({"cmd": "ticks", "rows": chunk})
-                    if not ok:
-                        return  # child gone — stream task finalises
-                h.last_tick_msc = fresh[-1][0]
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            logger.exception("paper tick poll %s crashed", run_id)
-        finally:
-            if client is not None:
-                await client.aclose()
+    def _gateway_client_for(self, h: _RunHandle) -> Optional[GatewayClient]:
+        if h.node_type == "ea_bridge":
+            return None
+        return GatewayClient.for_registered_node(h.gateway_url or None)
 
     # ── control ────────────────────────────────────────────────
-
-    async def pause(self, run_id: str) -> str:
-        async with AsyncSessionLocal() as db:
-            res = await db.execute(
-                update(PaperRun)
-                .where(PaperRun.id == _uuid(run_id), PaperRun.status == "running")
-                .values(status="paused")
-            )
-            await db.commit()
-            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
-                row = await db.scalar(select(PaperRun.status).where(
-                    PaperRun.id == _uuid(run_id)))
-                return row or "not_found"
-        h = self._handles.get(run_id)
-        if h is not None:
-            h.paused.set()
-        return "paused"
-
-    async def resume(self, run_id: str) -> str:
-        async with AsyncSessionLocal() as db:
-            res = await db.execute(
-                update(PaperRun)
-                .where(PaperRun.id == _uuid(run_id), PaperRun.status == "paused")
-                .values(status="running")
-            )
-            await db.commit()
-            if not res.rowcount:  # type: ignore[attr-defined]  # SQLAlchemy Result type annotation gap — real type has .rowcount/.scalars()
-                row = await db.scalar(select(PaperRun.status).where(
-                    PaperRun.id == _uuid(run_id)))
-                return row or "not_found"
-        h = self._handles.get(run_id)
-        if h is not None:
-            h.paused.clear()
-        else:
-            # process gone (e.g. backend restarted while paused) — re-spawn
-            await self._reclaim(run_id)
-        return "running"
-
-    async def reset_anchor(self, run_id: str) -> str:
-        """Ask the sandbox child to re-anchor its grid to the latest quote.
-
-        Returns "ok", or "not_running" when the child is gone / still replaying.
-        """
-        h = self._handles.get(run_id)
-        if h is None or h.stopping or not h.child_live:
-            return "not_running"
-        ok = await h.sup.send({"cmd": "reset_anchor"})
-        return "ok" if ok else "not_running"
+    # pause / resume / reset_anchor live on BaseRunManager; stop / reset stay
+    # here (they touch PaperRun columns and the sandbox child).
 
     async def stop(self, run_id: str, close_positions: bool) -> str:
         async with AsyncSessionLocal() as db:
@@ -887,18 +778,6 @@ class PaperManager(BaseRunManager[_RunHandle]):
         await self.start(run_id)
         return "pending"
 
-    async def _reclaim(self, run_id: str) -> None:
-        """Re-spawn a run whose process died (restart-orphan resume path)."""
-        uid = _uuid(run_id)
-        async with AsyncSessionLocal() as db:
-            run = await db.get(PaperRun, uid)
-            if run is None:
-                return
-            run.status = "pending"
-            db.add(run)
-            await db.commit()
-        await self.start(run_id)
-
     async def _fail(self, run_id: str, code: str, message: str) -> None:
         async with AsyncSessionLocal() as db:
             run = await db.get(PaperRun, _uuid(run_id))
@@ -924,11 +803,6 @@ class PaperManager(BaseRunManager[_RunHandle]):
                     run_id=run.id,
                     detail=message,
                 ).emit(db=db)
-
-
-def _chunks(seq: list, size: int) -> list[list]:
-    """Split ``seq`` into consecutive chunks of at most ``size`` items."""
-    return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
 def _ea_bars_to_rows(bars: list) -> list[dict]:
@@ -998,40 +872,5 @@ def _ea_account_event(raw: dict, last_ts: int) -> dict:
     return out
 
 
-def _select_history(rows: list[dict], tf: int, now_epoch: int, need: int) -> list[dict]:
-    """Keep only CLOSED bars (``time + tf <= now``) and trim to the last ``need``.
-
-    The gateway's "latest N" endpoint can return a still-forming live bar;
-    feeding it at startup would either be skipped by the poll cursor or fill
-    a signal before its period has elapsed.  Weekend/holiday gaps are handled
-    upstream by the endpoint's fallback, so we never drop bars for being old.
-    """
-    closed = [r for r in rows if int(r["time"]) + tf <= now_epoch]
-    return closed[-need:] if need > 0 else []
-
-
-def _rows_to_arrays(rows: list[dict]) -> BarArrays:
-    times = sorted({int(r["time"]) for r in rows})
-    by_time = {int(r["time"]): r for r in rows}
-    return BarArrays(
-        time=np.asarray(times, dtype="int64"),
-        open=np.asarray([by_time[t]["open"] for t in times], dtype="float64"),
-        high=np.asarray([by_time[t]["high"] for t in times], dtype="float64"),
-        low=np.asarray([by_time[t]["low"] for t in times], dtype="float64"),
-        close=np.asarray([by_time[t]["close"] for t in times], dtype="float64"),
-        tick_volume=np.asarray(
-            [by_time[t].get("tick_volume", 0) for t in times], dtype="int64"
-        ),
-        spread=np.asarray([by_time[t].get("spread", 0) for t in times], dtype="int64"),
-    )
-
-
 # ── singleton ──────────────────────────────────────────────────
-_manager_singleton: Optional[PaperManager] = None
-
-
-def get_paper_manager() -> PaperManager:
-    global _manager_singleton
-    if _manager_singleton is None:
-        _manager_singleton = PaperManager()
-    return _manager_singleton
+get_paper_manager = _make_singleton(PaperManager)

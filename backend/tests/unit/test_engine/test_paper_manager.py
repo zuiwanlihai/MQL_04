@@ -10,7 +10,8 @@ import app.services.live.manager as live_manager_mod
 import app.services.paper.manager as paper_manager_mod
 from app.config import settings
 from app.services.gateway_client import GatewayError
-from app.services.paper.manager import PaperManager, _chunks, _select_history
+from app.services.paper.manager import PaperManager
+from app.services.run_base import _chunks, _select_history
 
 TF = 3600  # H1
 
