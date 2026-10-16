@@ -131,7 +131,11 @@ export function useToggleAlgoTrading() {
       );
       return data;
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['accounts'] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accounts'] });
+      // 终端按钮实况在 active-account 探活里 → 立即刷新徽标（不必等 15s 轮询）
+      qc.invalidateQueries({ queryKey: ['active-account'] });
+    },
   });
 }
 

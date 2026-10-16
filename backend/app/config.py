@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     BACKTEST_ENABLED: bool = Field(default=True)
     BACKTEST_MAX_CONCURRENCY: int = Field(default=2, ge=1)
     BACKTEST_TIMEOUT_SECONDS: int = Field(default=600, ge=10)
-    BACKTEST_MAX_BARS: int = Field(default=1_000_000, ge=1000)
+    BACKTEST_MAX_BARS: int = Field(default=1_300_000, ge=1000)
     BACKTEST_RUNTIME_DIR: Path = Field(
         default=PROJECT_ROOT / ".runtime" / "backtests",
         description="Per-task payload/temp directory root.",
@@ -143,6 +143,10 @@ class Settings(BaseSettings):
     PAPER_RUNTIME_DIR: Path = Field(
         default=PROJECT_ROOT / ".runtime" / "paper",
         description="Per-run payload/storage directory root.",
+    )
+    SYNTHETIC_RUNTIME_DIR: Path = Field(
+        default=PROJECT_ROOT / ".runtime" / "synthetic",
+        description="Synthetic dataset Parquet files root.",
     )
     PAPER_STOP_OUT_LEVEL: float = Field(
         default=50.0, ge=1.0, description="Margin level (%) triggering stop-out."

@@ -337,119 +337,103 @@ export default function OneClickTrade({
     'flex items-center gap-1.5 px-4 py-1.5 rounded-md text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
 
   return (
-    <div className="relative flex items-center gap-2" data-testid="one-click-trade">
-      {/* 当前品种持仓盈亏 — 每笔一笔，实时跳动 */}
+    <div className="relative flex flex-wrap items-center gap-x-2 gap-y-1.5" data-testid="one-click-trade">
+      {/* 当前品种持仓盈亏 — 按货币汇总：同币种下只显示 货币 / 总手数 / 笔数 / 总盈亏 */}
       {livePositions.length > 0 && (
-        <div className="flex items-center gap-1.5 whitespace-nowrap" data-testid="position-pnl">
+        <div className="flex flex-wrap items-center gap-1.5" data-testid="position-pnl">
           <span
             className="text-xs font-mono font-medium text-gray-300 pr-0.5"
             title={`当前品种 ${symbol.toUpperCase()} 的持仓`}
           >
             {symbol.toUpperCase()}
           </span>
-          {livePositions.map(({ pos, pl }) => (
-            <span
-              key={pos.ticket}
-              className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-surface-800/70 cursor-default"
-              title={
-                `#${pos.ticket} ${pos.type === 'buy' ? '买入' : '卖出'} ${pos.volume} 手 @` +
-                `${formatPrice(pos.price_open, digits)} → 现价 ${formatPrice(pos.price_current, digits)}\n` +
-                `浮动盈亏 ${pl.toFixed(2)}${currency ? ` ${currency}` : ''}` +
-                `（库存费 ${pos.swap.toFixed(2)} · 手续费 ${pos.commission.toFixed(2)}，` +
-                `净值 ${netProfit(pos).toFixed(2)}${currency ? ` ${currency}` : ''}）`
-              }
-            >
-              <span
-                className={`text-xs font-medium ${pos.type === 'buy' ? 'text-blue-400' : 'text-rose-400'}`}
-              >
-                {pos.type === 'buy' ? '买' : '卖'}
-              </span>
-              <span className="text-xs font-mono text-gray-400">{pos.volume}</span>
-              <span
-                className={`text-xs font-mono font-semibold ${pl >= 0 ? 'text-profit' : 'text-loss'}`}
-              >
-                {pl >= 0 ? '+' : ''}
-                {pl.toFixed(2)}
-              </span>
-              {currency && (
-                <span className="text-2xs font-mono text-gray-500">{currency}</span>
-              )}
+          <span
+            className={`flex items-center gap-1.5 px-2 py-0.5 rounded bg-surface-800/70 cursor-default ${
+              totalPl >= 0 ? 'border border-profit/20' : 'border border-loss/20'
+            }`}
+            title={
+              livePositions
+                .map(({ pos, pl }) =>
+                  `#${pos.ticket} ${pos.type === 'buy' ? '买' : '卖'} ${pos.volume} 手 @` +
+                  `${formatPrice(pos.price_open, digits)} → ${pl >= 0 ? '+' : ''}${pl.toFixed(2)}${currency ? ` ${currency}` : ''}`
+                )
+                .join('\n') +
+              `\n合计 ${totalPl >= 0 ? '+' : ''}${totalPl.toFixed(2)}${currency ? ` ${currency}` : ''}（净值 ${totalNet.toFixed(2)}${currency ? ` ${currency}` : ''}）`
+            }
+          >
+            <span className="text-xs text-gray-500">{currency ?? '—'}</span>
+            <span className="text-xs font-mono text-gray-300">
+              {(positions.reduce((s, p) => s + p.volume, 0)).toFixed(2)}手
             </span>
-          ))}
-          {livePositions.length > 1 && (
+            <span className="text-xs text-gray-500">×</span>
+            <span className="text-xs font-mono text-gray-300">{livePositions.length}笔</span>
             <span
-              className="flex items-center gap-1 pl-1 cursor-default"
-              title={`净值合计（含库存费/手续费）${totalNet.toFixed(2)}${currency ? ` ${currency}` : ''}`}
+              className={`text-xs font-mono font-semibold ${totalPl >= 0 ? 'text-profit' : 'text-loss'}`}
             >
-              <span className="text-xs text-gray-500">合计</span>
-              <span
-                className={`text-xs font-mono font-semibold ${totalPl >= 0 ? 'text-profit' : 'text-loss'}`}
-              >
-                {totalPl >= 0 ? '+' : ''}
-                {totalPl.toFixed(2)}
-              </span>
-              {currency && (
-                <span className="text-2xs font-mono text-gray-500">{currency}</span>
-              )}
+              {totalPl >= 0 ? '+' : ''}
+              {totalPl.toFixed(2)}
             </span>
-          )}
+          </span>
         </div>
       )}
-      <label className="flex items-center gap-1.5" title="下单手数（自动记忆）">
-        <span className="text-xs text-gray-500 whitespace-nowrap">手数</span>
-        <input
-          className="input-dark w-16 px-2 py-1.5 text-center font-mono text-sm"
-          value={volume}
-          onChange={(e) => changeVolume(e.target.value)}
-          placeholder="0.01"
-          inputMode="decimal"
-        />
-      </label>
-      <button
-        type="button"
-        className={`${btnBase} bg-blue-600 hover:bg-blue-500 text-white`}
-        disabled={Boolean(disabledReason) || busy}
-        title={disabledReason ?? '市价买入（一键下单）'}
-        onClick={() => submitOrder('buy')}
-      >
-        {order.isPending && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-        买入
-      </button>
-      <button
-        type="button"
-        className={`${btnBase} bg-rose-600 hover:bg-rose-500 text-white`}
-        disabled={Boolean(disabledReason) || busy}
-        title={disabledReason ?? '市价卖出（一键下单）'}
-        onClick={() => submitOrder('sell')}
-      >
-        {order.isPending && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-        卖出
-      </button>
-      <button
-        type="button"
-        className="px-3 py-1.5 rounded-md border border-gray-600 text-gray-300 hover:bg-surface-800 hover:text-white text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
-        disabled={Boolean(disabledReason) || busy}
-        title={disabledReason ?? '挂限价/突破单'}
-        onClick={togglePending}
-      >
-        {showPending ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-        挂单
-      </button>
-      <button
-        type="button"
-        className="px-3 py-1.5 rounded-md border border-gray-600 text-gray-300 hover:bg-surface-800 hover:text-loss text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
-        disabled={Boolean(disabledReason) || busy || positions.length === 0}
-        title={
-          disabledReason ??
-          (positions.length === 0
-            ? '当前品种无持仓'
-            : `平掉 ${symbol} 的 ${positions.length} 笔持仓`)
-        }
-        onClick={closeAll}
-      >
-        {closing && <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" />}
-        全部平仓
-      </button>
+      {/* 操作按钮组：ml-auto 钉右侧，flex-shrink-0 永不被持仓标签挤出屏幕 */}
+      <div className="ml-auto flex items-center gap-2 flex-shrink-0">
+        <label className="flex items-center gap-1.5" title="下单手数（自动记忆）">
+          <span className="text-xs text-gray-500 whitespace-nowrap">手数</span>
+          <input
+            className="input-dark w-16 px-2 py-1.5 text-center font-mono text-sm"
+            value={volume}
+            onChange={(e) => changeVolume(e.target.value)}
+            placeholder="0.01"
+            inputMode="decimal"
+          />
+        </label>
+        <button
+          type="button"
+          className={`${btnBase} bg-blue-600 hover:bg-blue-500 text-white`}
+          disabled={Boolean(disabledReason) || busy}
+          title={disabledReason ?? '市价买入（一键下单）'}
+          onClick={() => submitOrder('buy')}
+        >
+          {order.isPending && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+          买入
+        </button>
+        <button
+          type="button"
+          className={`${btnBase} bg-rose-600 hover:bg-rose-500 text-white`}
+          disabled={Boolean(disabledReason) || busy}
+          title={disabledReason ?? '市价卖出（一键下单）'}
+          onClick={() => submitOrder('sell')}
+        >
+          {order.isPending && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+          卖出
+        </button>
+        <button
+          type="button"
+          className="px-3 py-1.5 rounded-md border border-gray-600 text-gray-300 hover:bg-surface-800 hover:text-white text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+          disabled={Boolean(disabledReason) || busy}
+          title={disabledReason ?? '挂限价/突破单'}
+          onClick={togglePending}
+        >
+          {showPending ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+          挂单
+        </button>
+        <button
+          type="button"
+          className="px-3 py-1.5 rounded-md border border-gray-600 text-gray-300 hover:bg-surface-800 hover:text-loss text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+          disabled={Boolean(disabledReason) || busy || positions.length === 0}
+          title={
+            disabledReason ??
+            (positions.length === 0
+              ? '当前品种无持仓'
+              : `平掉 ${symbol} 的 ${positions.length} 笔持仓`)
+          }
+          onClick={closeAll}
+        >
+          {closing && <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" />}
+          全部平仓
+        </button>
+      </div>
       {msg && (
         <span
           className={`text-xs font-mono max-w-64 truncate ${

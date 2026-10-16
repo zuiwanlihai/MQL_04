@@ -14,6 +14,7 @@ function node(
   return {
     node_id: 'n1',
     node_name: '本地网关',
+    terminal_trade_allowed: true,
     account:
       account_type === null
         ? null

@@ -106,6 +106,9 @@ docker-compose.override.yml
 # nothing ever reads again — tracking them makes `git status` permanently
 # dirty and buries real diffs in noise.
 .runtime/
+# Local service logs and ad-hoc diagnostic scripts (start-all.ps1 writes the
+# backend/gateway/postgres logs here at runtime).
+logs/
 # Symbol metadata cache, rebuilt from the terminal on demand.
 .symbols.json
 # Compiled MQL5 binary (deploy/ea/EAQuantBridge.ex5).  Build artifact: the

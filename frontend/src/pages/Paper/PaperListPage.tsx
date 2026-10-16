@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { BookOpen, ChevronLeft, ChevronRight, Pause, Play, Square, Trash2 } from 'lucide-react';
+import { BookOpen, ChevronLeft, ChevronRight, Pause, Play, Plus, Square, Trash2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import PaperCreateDialog from '@/components/paper/PaperCreateDialog';
 import StrategyLogicDialog from '@/components/strategy/StrategyLogicDialog';
@@ -42,7 +42,7 @@ const ACTIVE: PaperRunStatus[] = ['pending', 'running', 'stopping'];
 const money = (v: number | null | undefined) =>
   v == null ? '—' : v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-export default function PaperListPage() {
+export default function PaperListPage({ compact = false }: { compact?: boolean }) {
   const [page, setPage] = useState(1);
   const [status, setStatus] = useState<'' | PaperRunStatus>('');
   const [strategyId, setStrategyId] = useState('');
@@ -63,11 +63,13 @@ export default function PaperListPage() {
 
   // 已停止/失败的虚拟下单「开始」= 以相同配置重建并启动（原记录保留）
   const restartRun = async (t: PaperRun) => {
-    if (t.account_id == null) return;
     try {
       await create.mutateAsync({
         strategy_id: t.strategy_id,
-        account_id: t.account_id,
+        // gateway 模式绑定原账户；synthetic 模式复用原数据集
+        ...(t.data_source === 'synthetic'
+          ? { data_source: 'synthetic' as const, synthetic_dataset_id: t.synthetic_dataset_id }
+          : { account_id: t.account_id }),
         version: t.strategy_version,
         symbol: t.symbol,
         timeframe: t.timeframe,
@@ -87,19 +89,36 @@ export default function PaperListPage() {
     }
   };
 
+  // 重启可行性：gateway 任务需已绑定账户；synthetic 任务需数据集引用仍在（删除后置 NULL）
+  const canRestart = (t: PaperRun) =>
+    t.data_source === 'synthetic' ? t.synthetic_dataset_id != null : t.account_id != null;
+  const restartBlockReason = (t: PaperRun) =>
+    t.data_source === 'synthetic'
+      ? '原合成数据集已被删除，无法重启'
+      : '旧任务未绑定账户，无法重启';
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between gap-4 flex-wrap">
-        <div>
-          <h1 className="text-xl font-semibold text-white">虚拟下单中心</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            长驻沙箱进程 · 按已收盘 K 线增量撮合 · 暂停 / 开始 / 停止 / 删除
-          </p>
+      {!compact && (
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div>
+            <h1 className="text-xl font-semibold text-white">虚拟下单中心</h1>
+            <p className="text-sm text-gray-500 mt-1">
+              长驻沙箱进程 · 按已收盘 K 线增量撮合 · 暂停 / 开始 / 停止 / 删除
+            </p>
+          </div>
+          <button type="button" className="btn-primary" onClick={() => setCreateOpen(true)}>
+            新建虚拟下单
+          </button>
         </div>
-        <button type="button" className="btn-primary" onClick={() => setCreateOpen(true)}>
-          新建虚拟下单
-        </button>
-      </div>
+      )}
+      {compact && (
+        <div className="flex items-center justify-end gap-4">
+          <button type="button" className="btn-primary" onClick={() => setCreateOpen(true)}>
+            <Plus className="w-4 h-4" /> 新建虚拟下单
+          </button>
+        </div>
+      )}
 
       <div className="flex items-center gap-3 flex-wrap">
         <select
@@ -188,7 +207,17 @@ export default function PaperListPage() {
                       </p>
                     </td>
                     <td className="text-gray-400 text-xs font-mono whitespace-nowrap">
-                      {acct ? `${acct.login}@${acct.server}` : t.account_id ? '已解绑账户' : '默认网关（旧任务）'}
+                      {t.data_source === 'synthetic' ? (
+                        <span title="合成数据集回放，不占用 MT5 账户">
+                          合成数据集{t.synthetic_dataset_id != null ? ` #${t.synthetic_dataset_id}` : ''}
+                        </span>
+                      ) : acct ? (
+                        `${acct.login}@${acct.server}`
+                      ) : t.account_id ? (
+                        '已解绑账户'
+                      ) : (
+                        '默认网关（旧任务）'
+                      )}
                     </td>
                     <td className="text-gray-400">
                       <span className="font-mono">{t.symbol}</span>
@@ -292,7 +321,7 @@ export default function PaperListPage() {
                           <span className="text-gray-700 mx-2">|</span>
                           <button
                             type="button"
-                            disabled={anyPending || t.account_id == null}
+                            disabled={anyPending || !canRestart(t)}
                             className="text-profit hover:text-profit-light text-sm disabled:opacity-50"
                             onClick={() => {
                               if (window.confirm(
@@ -301,7 +330,7 @@ export default function PaperListPage() {
                                 restartRun(t);
                               }
                             }}
-                            title={t.account_id == null ? '旧任务未绑定账户，无法重启' : '以相同配置重建并启动'}
+                            title={canRestart(t) ? '以相同配置重建并启动' : restartBlockReason(t)}
                           >
                             <Play className="w-3.5 h-3.5 inline" /> 开始
                           </button>

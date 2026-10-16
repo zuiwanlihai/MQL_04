@@ -37,9 +37,15 @@ from sqlalchemy import delete, update
 
 from app.config import settings
 from app.engine.session import AsyncSessionLocal
-from app.models import PaperLog, PaperRun, PaperTrade
+from app.models import PaperLog, PaperRun, PaperTrade, SyntheticDataset
 from app.sandbox.matching import TF_SECONDS
 from app.sandbox.payload import BacktestPayload, save_payload
+from app.services.backtest.data_fetcher import (
+    DataUnavailableError,
+    aggregate_m1_to_tf,
+    bars_from_local,
+)
+from app.services.synthetic.generator import load_synthetic_bars
 from app.services.backtest.supervisor import (
     TERM_COMPLETED,
     TERM_STALLED,
@@ -85,18 +91,20 @@ class _RunHandle:
     run_id: str
     sup: RunnerSupervisor
     stream_task: asyncio.Task
-    poll_task: asyncio.Task
+    poll_task: asyncio.Task | None
     dir: Path
     symbol: str
     timeframe: str
     tf_seconds: int
     gateway_url: str = ""  # M12: node resolved from the bound account at start
-    node_type: str = "python"  # python | ea_bridge (P4 EB-1 tick feed branch)
+    node_type: str = "python"  # python | ea_bridge (P4 EB-1 tick feed branch) | synthetic
     ea_node_id: str = ""  # registry key when node_type == "ea_bridge"
     paused: asyncio.Event = field(default_factory=asyncio.Event)
     ready: bool = False  # startup replay drained (first account event)
     stopping: bool = False
     last_ts: int = 0  # epoch of last delivered bar (poll cursor)
+    # synthetic 模式：剩余 bars 队列（startup replay 后由 fake poll 按节奏投递）
+    synthetic_queue: list[list[float]] = field(default_factory=list)
     # on_tick feed (SDK v1.1.0): in-memory cursor + child-live gate
     has_on_tick: bool = False
     tick_task: Optional[asyncio.Task] = None
@@ -158,20 +166,58 @@ class PaperManager(BaseRunManager[_RunHandle]):
             run = await db.get(PaperRun, uid)
             assert run is not None
             payload_dir = Path(settings.PAPER_RUNTIME_DIR) / run_id
-            # M12: route every gateway call to the node the bound account lives
-            # on (MT5 single-terminal = one account per node).  Legacy rows with
-            # no account fall back to the global default and skip login.
-            gateway_url = await resolve_gateway(db, run.account_id)
-            node = await resolve_node(db, run.account_id)
-            node_type = node.type if node is not None else "python"
-            ea_node_id = ""
-            if node_type == "ea_bridge":
-                assert node is not None, "ea_bridge node must exist when type matches"
-                ea_node_id = str(node.id)
-            creds = (await account_credentials(db, run.account_id)
-                     if run.account_id is not None else None)
 
-        if node_type == "ea_bridge":
+            # 1) synthetic 模式：不需要网关/账户，直接从合成数据集取数
+            if run.data_source == "synthetic":
+                ds = await db.get(SyntheticDataset, run.synthetic_dataset_id)
+                if ds is None:
+                    await self._fail(
+                        run_id, "DATA_UNAVAILABLE",
+                        f"合成数据集 #{run.synthetic_dataset_id} 不存在",
+                    )
+                    return
+                try:
+                    m1_bars = load_synthetic_bars(
+                        ds, runtime_dir=settings.SYNTHETIC_RUNTIME_DIR,
+                    )
+                    aggregated = aggregate_m1_to_tf(m1_bars, run.timeframe)
+                except DataUnavailableError as exc:
+                    await self._fail(run_id, "DATA_UNAVAILABLE", str(exc))
+                    return
+                if len(aggregated) < run.warmup_bars + 2:
+                    await self._fail(
+                        run_id, "DATA_UNAVAILABLE",
+                        f"合成数据集聚合后仅 {len(aggregated)} 根 {run.timeframe}，"
+                        f"不足以覆盖 warmup（{run.warmup_bars}）+ 交易期（至少 2 根）",
+                    )
+                    return
+                info = _synthetic_symbol_info(run.symbol or ds.symbol)
+                tf = TF_SECONDS[run.timeframe]
+                # startup replay 规模：warmup + PAPER_HISTORY_BARS（与 gateway 一致）
+                replay_size = run.warmup_bars + settings.PAPER_HISTORY_BARS
+                replay_bars = aggregated[:replay_size]
+                # 剩余 bars 进 synthetic_queue，由 fake poll 逐根投递
+                remaining = aggregated[replay_size:]
+                rows = replay_bars
+            else:
+                # M12: route every gateway call to the node the bound account lives
+                # on (MT5 single-terminal = one account per node).  Legacy rows with
+                # no account fall back to the global default and skip login.
+                gateway_url = await resolve_gateway(db, run.account_id)
+                node = await resolve_node(db, run.account_id)
+                node_type = node.type if node is not None else "python"
+                ea_node_id = ""
+                if node_type == "ea_bridge":
+                    assert node is not None, "ea_bridge node must exist when type matches"
+                    ea_node_id = str(node.id)
+                creds = (await account_credentials(db, run.account_id)
+                         if run.account_id is not None else None)
+
+        if run.data_source == "synthetic":
+            node_type = "synthetic"
+            gateway_url = ""
+            ea_node_id = ""
+        elif node_type == "ea_bridge":
             # P4 EB-2: EA 桥节点完整数据面 —— 启动快照走 rates RPC。
             # 「最新 N 根」语义（禁固定日历窗）：休市/周末固定回看窗口会整段
             # 落入无数据区间；EA 侧 CopyRates 按根数取天然落在最近 bar 上。
@@ -225,18 +271,21 @@ class PaperManager(BaseRunManager[_RunHandle]):
             finally:
                 await client.aclose()
 
-        # 最新 N 根可能含尚未收盘的实时 bar；只保留已收盘 bar，
-        # 与 poll 的 time+tf<=now 语义对齐，避免末根被跳过或提前成交。
-        rows = _select_history(rows, tf, int(time.time()), need)
+        # synthetic 模式：不需要 select_history（所有 bars 都是"已收盘"）
+        if run.data_source != "synthetic":
+            rows = _select_history(rows, tf, int(time.time()), need)
         if not rows:
             await self._fail(
                 run_id, "UNKNOWN_ERROR",
-                f"网关无 {run.symbol} {run.timeframe} 历史数据，无法启动虚拟下单",
+                f"网关无 {run.symbol} {run.timeframe} 历史数据，无法启动虚拟下单"
+                if run.data_source != "synthetic"
+                else "合成数据集聚合后 bars 为空，无法启动虚拟下单",
             )
             return
         arrays = self._rows_to_arrays(rows)
+        spread_snapshot = float(info.get("spread", 0) or 0)
         payload = self._build_payload(
-            run, info, float(info.get("spread", 0) or 0),
+            run, info, spread_snapshot,
             has_on_tick=has_callback(run.source_code, "on_tick"),
         )
         try:
@@ -262,9 +311,7 @@ class PaperManager(BaseRunManager[_RunHandle]):
             stream_task=asyncio.create_task(
                 self._stream(run_id), name=f"paper-stream-{run_id[:8]}"
             ),
-            poll_task=asyncio.create_task(
-                self._poll(run_id), name=f"paper-poll-{run_id[:8]}"
-            ),
+            poll_task=None,  # 下面根据 node_type 填
             dir=payload_dir,
             symbol=run.symbol,
             timeframe=run.timeframe,
@@ -274,6 +321,20 @@ class PaperManager(BaseRunManager[_RunHandle]):
             ea_node_id=ea_node_id,
             last_ts=int(rows[-1]["time"]),
         )
+        if node_type == "synthetic":
+            # 把 remaining bars 转成 poll 投递给 runner 的 list 格式
+            h.synthetic_queue = [
+                [r["time"], r["open"], r["high"], r["low"], r["close"],
+                 r.get("tick_volume", 0), r.get("spread", 0)]
+                for r in remaining
+            ]
+            h.poll_task = asyncio.create_task(
+                self._synthetic_poll(run_id), name=f"paper-synth-{run_id[:8]}"
+            )
+        else:
+            h.poll_task = asyncio.create_task(
+                self._poll(run_id), name=f"paper-poll-{run_id[:8]}"
+            )
         if payload.has_on_tick:
             h.has_on_tick = True
             h.last_tick_msc = int(time.time() * 1000)
@@ -606,6 +667,52 @@ class PaperManager(BaseRunManager[_RunHandle]):
 
     # ── poll task (closed-bar delivery) ────────────────────────
 
+    async def _synthetic_poll(self, run_id: str) -> None:
+        """合成数据模式 fake poll：从 synthetic_queue 按模拟时钟节奏投递 bars。
+
+        startup replay 完成后（h.ready=True），每 sleep(PAPER_POLL_SECONDS) 取
+        一根合成 bar 投递给 runner（按 tf_seconds 间隔推进），队列空了自动发
+        stop close=True —— run 自然进入 stopped 状态。
+        """
+        h = self._handles.get(run_id)
+        assert h is not None
+        # 等 startup replay 排水（ready=True）
+        while h is not self._handles.get(run_id) or not h.ready:
+            await asyncio.sleep(0.1)
+            if h.stopping:
+                return
+        # 为了不把 synthetic bars 拉成 10x 时间尺度，用一个更短的投递间隔：
+        # PAPER_POLL_SECONDS 是给 gateway 用的实时轮询（5~10s），synthetic 模式
+        # 直接按 tf_seconds / 2 推进（M1=30s 一根, H1=30min 一根...），这样
+        # 一个月合成数据 ≈ 1 小时 real time 跑完。
+        delivery_interval = max(h.tf_seconds // 2, 2)
+        try:
+            while h.synthetic_queue:
+                if h.stopping:
+                    return
+                if h.paused.is_set():
+                    await asyncio.sleep(0.5)
+                    continue
+                # 投一根（或最多 5 根一起投）
+                batch = h.synthetic_queue[:5]
+                h.synthetic_queue = h.synthetic_queue[5:]
+                ok = await h.sup.send({"cmd": "bars", "rows": batch})
+                if not ok:
+                    return  # child gone — stream task finalises
+                h.last_ts = max(int(r[0]) for r in batch)
+                await asyncio.sleep(delivery_interval)
+            # 队列空了 — 自动收尾
+            logger.info(
+                "paper synthetic %s queue drained (%d leftover); sending stop",
+                run_id, len(h.synthetic_queue),
+            )
+            h.stopping = True
+            await h.sup.send({"cmd": "stop", "close": True})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("synthetic poll %s crashed", run_id)
+
     async def _poll(self, run_id: str) -> None:
         h = self._handles.get(run_id)
         assert h is not None
@@ -739,7 +846,12 @@ class PaperManager(BaseRunManager[_RunHandle]):
         return "stopping"
 
     async def reset(self, run_id: str) -> str:
-        """Wipe run history (trades/logs/storage) and start fresh."""
+        """Wipe run history (trades/logs/storage) and start fresh.
+
+        **关键**：从 strategy_templates 表加载最新源码覆盖 run.source_code，
+        让策略模板的 bug 修复（如 grid_trading.py 档位去重）能在 reset 后立刻生效。
+        旧行为用的是创建 run 时冻结的 source_code，reset 无法继承模板修复。
+        """
         uid = _uuid(run_id)
         h = self._handles.get(run_id)
         if h is not None:
@@ -757,6 +869,24 @@ class PaperManager(BaseRunManager[_RunHandle]):
             run = await db.get(PaperRun, uid)
             if run is None:
                 return "not_found"
+
+            # ── 模板热更新：reset 时从 strategy_templates 重新拉源码 ──
+            from sqlalchemy import select as _sel
+            from app.models.strategy import StrategyTemplate
+            templ_row = await db.execute(
+                _sel(StrategyTemplate).where(StrategyTemplate.name == run.strategy_id)
+            )
+            template = templ_row.scalar_one_or_none()
+            if template and template.source_code and template.source_code != run.source_code:
+                logging.info(
+                    "reset(%s): refreshing source_code from template '%s' "
+                    "(old=%d → new=%d chars)",
+                    run_id, run.strategy_id,
+                    len(run.source_code or ""), len(template.source_code),
+                )
+                run.source_code = template.source_code
+            # ────────────────────────────────────────────────────────────
+
             await db.execute(delete(PaperTrade).where(PaperTrade.run_id == uid))
             await db.execute(delete(PaperLog).where(PaperLog.run_id == uid))
             run.status = "pending"
@@ -803,6 +933,54 @@ class PaperManager(BaseRunManager[_RunHandle]):
                     run_id=run.id,
                     detail=message,
                 ).emit(db=db)
+
+
+def _synthetic_symbol_info(symbol: str) -> dict:
+    """合成数据集模式的品种参数推断（按 symbol 启发式匹配）。
+
+    网关模式下 symbol_info 来自真实品种的 ContractInfo；synthetic 模式下
+    没有网关可问，只能按品种名后缀/前缀硬编码合理默认值。这些参数影响
+    撮合价格（digits/point）、合约规模（contract_size）、杠杆保证金（margin_initial）。
+
+    spread 默认值也一并塞进来（_build_payload 需要 info.get("spread")）。
+    """
+    sym = symbol.upper().strip()
+    if sym.startswith("XAU") or sym.startswith("XAG") or sym.startswith("XPT"):
+        # 贵金属：MT5 通常 point=0.01, digits=2, contract_size=100
+        return {
+            "name": symbol, "description": f"Synthetic {symbol}",
+            "category": "synthetic/metals", "currency_base": "USD",
+            "currency_profit": "USD", "digits": 2, "point": 0.01,
+            "volume_step": 0.01, "volume_min": 0.01, "volume_max": 100.0,
+            "trade_contract_size": 100.0, "margin_initial": 1000.0,
+            "trade_mode": 4,  # full
+            "swap_long": 0.0, "swap_short": 0.0,
+            "spread": 0.3,  # 典型 XAUUSD 点差
+        }
+    if sym.endswith("JPY") or sym.endswith("HKD"):
+        # JPY/HKD 计价：point=0.001, digits=3
+        return {
+            "name": symbol, "description": f"Synthetic {symbol}",
+            "category": "synthetic/forex", "currency_base": sym[:3],
+            "currency_profit": sym[3:], "digits": 3, "point": 0.001,
+            "volume_step": 0.01, "volume_min": 0.01, "volume_max": 100.0,
+            "trade_contract_size": 100000.0, "margin_initial": 0.0,
+            "trade_mode": 4,
+            "swap_long": 0.0, "swap_short": 0.0,
+            "spread": 0.03,
+        }
+    # 默认：外汇主力品种参数
+    return {
+        "name": symbol, "description": f"Synthetic {symbol}",
+        "category": "synthetic/forex", "currency_base": sym[:3] if len(sym) >= 6 else "",
+        "currency_profit": sym[3:] if len(sym) >= 6 else "USD",
+        "digits": 5, "point": 0.00001,
+        "volume_step": 0.01, "volume_min": 0.01, "volume_max": 100.0,
+        "trade_contract_size": 100000.0, "margin_initial": 0.0,
+        "trade_mode": 4,
+        "swap_long": 0.0, "swap_short": 0.0,
+        "spread": 0.00002,
+    }
 
 
 def _ea_bars_to_rows(bars: list) -> list[dict]:

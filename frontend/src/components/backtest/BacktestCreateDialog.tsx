@@ -12,7 +12,7 @@ import StrategyParamsPanel from '@/components/strategies/StrategyParamsPanel';
 import { loadKlines, type KlineBar } from '@/lib/klineCache';
 import { useSymbols } from '@/hooks/useMarket';
 import { useWatchlist } from '@/lib/watchlist';
-import { apiError } from '@/lib/api';
+import { api, apiError } from '@/lib/api';
 import { resolveSchema, seedValues } from '@/lib/strategyParams';
 import type { ExecutionMode, SpreadMode } from '@/types/api';
 
@@ -41,7 +41,34 @@ export default function BacktestCreateDialog({ open, onClose, presetStrategyId }
   const [version, setVersion] = useState<number | null>(null);
   const [symbol, setSymbol] = useState('EURUSD');
   const [timeframe, setTimeframe] = useState('H1');
-  const [dataSource, setDataSource] = useState<'server' | 'local'>('server');
+  const [dataSource, setDataSource] = useState<'server' | 'local' | 'synthetic'>('server');
+  const [syntheticDatasetId, setSyntheticDatasetId] = useState<string>('');
+  // 合成数据集列表
+  const [syntheticDatasets, setSyntheticDatasets] = useState<
+    { id: number; name: string; symbol: string; bar_count: number; first_time: number; last_time: number }[]
+  >([]);
+  const [syntheticDsLoading, setSyntheticDsLoading] = useState(false);
+  useEffect(() => {
+    if (!open || dataSource !== 'synthetic') return;
+    let alive = true;
+    setSyntheticDsLoading(true);
+    api
+      .get<typeof syntheticDatasets>('/synthetic-datasets?limit=100')
+      .then((r) => { if (alive) setSyntheticDatasets(r.data); })
+      .catch(() => { if (alive) setSyntheticDatasets([]); })
+      .finally(() => { if (alive) setSyntheticDsLoading(false); });
+    return () => { alive = false; };
+  }, [open, dataSource]);
+  const selectedSynthDs = useMemo(
+    () => syntheticDatasets.find((d) => String(d.id) === syntheticDatasetId) ?? null,
+    [syntheticDatasets, syntheticDatasetId],
+  );
+  // 选合成数据集时，自动把 start/end 对齐到数据集的时间边界
+  useEffect(() => {
+    if (!selectedSynthDs) return;
+    setStart(toLocalInput(new Date(selectedSynthDs.first_time * 1000)));
+    setEnd(toLocalInput(new Date(selectedSynthDs.last_time * 1000)));
+  }, [selectedSynthDs?.id]);
   // 本地缓存K线（下载或浏览自选时落盘到服务器缓存）——异步加载，
   // 供"本地数据"选项展示根数/覆盖区间与提交
   const [cachedBars, setCachedBars] = useState<KlineBar[]>([]);
@@ -107,6 +134,8 @@ export default function BacktestCreateDialog({ open, onClose, presetStrategyId }
     if (!open) return;
     setAck(false);
     slippageTouched.current = false;
+    setDataSource('server');
+    setSyntheticDatasetId('');
     if (presetStrategyId) setStrategyId(presetStrategyId);
      
   }, [open, presetStrategyId]);
@@ -169,14 +198,18 @@ export default function BacktestCreateDialog({ open, onClose, presetStrategyId }
         }
       }
     }
+    if (dataSource === 'synthetic' && !syntheticDatasetId) return;
     create.mutate(
       {
         strategy_id: strategyId,
         version,
-        symbol: symbol.trim().toUpperCase(),
+        symbol: (dataSource === 'synthetic' && selectedSynthDs?.symbol)
+          ? selectedSynthDs.symbol
+          : symbol.trim().toUpperCase(),
         timeframe,
         data_source: dataSource,
         local_bars: dataSource === 'local' ? cachedBars : null,
+        synthetic_dataset_id: dataSource === 'synthetic' ? Number(syntheticDatasetId) : null,
         start_date: startDate.toISOString(),
         end_date: endDate.toISOString(),
         initial_deposit: Number(deposit),
@@ -214,6 +247,89 @@ export default function BacktestCreateDialog({ open, onClose, presetStrategyId }
           </button>
         </div>
         <div className="card-body space-y-4">
+          {/* ── Step 1: 数据来源（必须最先选，后续字段联动） ─────────────── */}
+          <div className="grid grid-cols-4 gap-3">
+            <label className="block col-span-4">
+              <span className="text-xs text-gray-400">
+                数据来源 <span className="text-red-400">*</span>
+                {dataSource === 'synthetic' && syntheticDatasets.length === 0 && (
+                  <button
+                    type="button"
+                    className="text-blue-400 hover:text-blue-300 text-xs ml-2 underline"
+                    onClick={() => {
+                      // 跳到合成数据集页面（策略回测 → 可视化虚拟数据）
+                      // 这里不硬编码路由，用户手动切 Tab 即可；弹窗关闭再打开会刷新列表
+                    }}
+                  >
+                    暂无数据集？去生成 →
+                  </button>
+                )}
+              </span>
+              <select
+                className="input-dark mt-1"
+                value={dataSource}
+                onChange={(e) => {
+                  setDataSource(e.target.value as 'server' | 'local' | 'synthetic');
+                  if (e.target.value !== 'synthetic') setSyntheticDatasetId('');
+                }}
+              >
+                <option value="server">服务器数据（网关 MT5 历史，推荐）</option>
+                <option
+                  value="local"
+                  disabled={!localCoverage?.enough}
+                  title={!localCoverage?.enough ? '本地无足够缓存：请先在行情页浏览该品种积累K线缓存' : ''}
+                >
+                  本地缓存数据{localCoverage ? `（${symbol} ${timeframe} · ${cachedBars.length} 根）` : '（无缓存）'}
+                </option>
+                <option value="synthetic">合成数据集（已保存的虚拟数据）</option>
+              </select>
+
+              {/* ── synthetic: 选数据集，品种/时间区间自动对齐 ── */}
+              {dataSource === 'synthetic' && (
+                <div className="mt-2 grid grid-cols-4 gap-2">
+                  <select
+                    className="input-dark col-span-3"
+                    value={syntheticDatasetId}
+                    disabled={syntheticDsLoading}
+                    onChange={(e) => setSyntheticDatasetId(e.target.value)}
+                  >
+                    <option value="">
+                      {syntheticDsLoading
+                        ? '加载中…'
+                        : syntheticDatasets.length === 0
+                          ? '（暂无合成数据集，请先到可视化虚拟数据页生成并保存）'
+                          : '请选择数据集…'}
+                    </option>
+                    {syntheticDatasets.map((d) => (
+                      <option key={d.id} value={String(d.id)}>
+                        #{d.id} {d.name}（{d.symbol} · {d.bar_count.toLocaleString()} 根 M1）
+                      </option>
+                    ))}
+                  </select>
+                  <div className="col-span-1 text-xs text-gray-500 flex items-center">
+                    {selectedSynthDs ? (
+                      <>
+                        锁定品种：
+                        <span className="font-mono text-gray-300 ml-1">{selectedSynthDs.symbol}</span>
+                      </>
+                    ) : '选完自动对齐'}
+                  </div>
+                </div>
+              )}
+
+              {/* ── local: 缓存覆盖提示 ── */}
+              {dataSource === 'local' && localCoverage && (
+                <span className="block mt-1 text-2xs text-blue-300">
+                  缓存覆盖：{localCoverage.first} ~ {localCoverage.last}
+                  {localCoverage.enough
+                    ? '。建议将回测区间设在覆盖范围内，区间外部分按交集执行。'
+                    : '。缓存不足 50 根，无法提交。'}
+                </span>
+              )}
+            </label>
+          </div>
+
+          {/* ── Step 2: 策略 + 版本 ────────────────────────────────────────── */}
           <div className="grid grid-cols-2 gap-3">
             <label className="block">
               <span className="text-xs text-gray-400">策略 *</span>
@@ -255,82 +371,94 @@ export default function BacktestCreateDialog({ open, onClose, presetStrategyId }
             </label>
           </div>
 
+          {/* ── Step 3: 品种 / 周期 / 时间区间（synthetic: 品种+时间锁死） ── */}
           <div className="grid grid-cols-4 gap-3">
-            <label className="block">
-              <span className="text-xs text-gray-400">品种 *</span>
-              <select
-                className="input-dark mt-1 font-mono"
-                value={symbol}
-                onChange={(e) => setSymbol(e.target.value)}
-              >
-                {!symbolOptions.some((s) => s.name === symbol) && (
-                  <option value={symbol}>{symbol}</option>
-                )}
-                {symbolOptions.map((s) => (
-                  <option key={s.name} value={s.name}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="block">
-              <span className="text-xs text-gray-400">周期</span>
-              <select className="input-dark mt-1" value={timeframe} onChange={(e) => setTimeframe(e.target.value)}>
-                {TIMEFRAMES.map((tf) => (
-                  <option key={tf} value={tf}>
-                    {tf}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="block">
-              <span className="text-xs text-gray-400">起始时间 *</span>
-              <input
-                type="datetime-local"
-                className="input-dark mt-1"
-                value={start}
-                onChange={(e) => setStart(e.target.value)}
-              />
-            </label>
-            <label className="block">
-              <span className="text-xs text-gray-400">结束时间 *</span>
-              <input
-                type="datetime-local"
-                className="input-dark mt-1"
-                value={end}
-                onChange={(e) => setEnd(e.target.value)}
-              />
-            </label>
+            {dataSource === 'synthetic' ? (
+              <>
+                <label className="block">
+                  <span className="text-xs text-gray-400">品种（数据集自带，锁定）</span>
+                  <input
+                    className="input-dark mt-1 font-mono"
+                    value={selectedSynthDs?.symbol ?? '—'}
+                    disabled
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-400">回测周期</span>
+                  <select
+                    className="input-dark mt-1"
+                    value={timeframe}
+                    onChange={(e) => setTimeframe(e.target.value)}
+                    title="合成数据集原生是 M1，回测时会自动聚合到所选周期"
+                  >
+                    {TIMEFRAMES.map((tf) => (
+                      <option key={tf} value={tf}>
+                        {tf}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block col-span-2">
+                  <span className="text-xs text-gray-400">虚拟数据时间（不可修改）</span>
+                  <div className="mt-1 input-dark py-2 text-xs text-gray-300 font-mono truncate">
+                    {selectedSynthDs
+                      ? `${new Date(selectedSynthDs.first_time * 1000).toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'short' })}  ~  ${new Date(selectedSynthDs.last_time * 1000).toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'short' })}`
+                      : '— 请先选择数据集 —'}
+                  </div>
+                </label>
+              </>
+            ) : (
+              <>
+                <label className="block">
+                  <span className="text-xs text-gray-400">品种 *</span>
+                  <select
+                    className="input-dark mt-1 font-mono"
+                    value={symbol}
+                    onChange={(e) => setSymbol(e.target.value)}
+                  >
+                    {!symbolOptions.some((s) => s.name === symbol) && (
+                      <option value={symbol}>{symbol}</option>
+                    )}
+                    {symbolOptions.map((s) => (
+                      <option key={s.name} value={s.name}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-400">周期</span>
+                  <select className="input-dark mt-1" value={timeframe} onChange={(e) => setTimeframe(e.target.value)}>
+                    {TIMEFRAMES.map((tf) => (
+                      <option key={tf} value={tf}>
+                        {tf}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-400">起始时间 *</span>
+                  <input
+                    type="datetime-local"
+                    className="input-dark mt-1"
+                    value={start}
+                    onChange={(e) => setStart(e.target.value)}
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-xs text-gray-400">结束时间 *</span>
+                  <input
+                    type="datetime-local"
+                    className="input-dark mt-1"
+                    value={end}
+                    onChange={(e) => setEnd(e.target.value)}
+                  />
+                </label>
+              </>
+            )}
           </div>
 
-          <div className="grid grid-cols-4 gap-3">
-            <label className="block col-span-4">
-              <span className="text-xs text-gray-400">数据来源 *</span>
-              <select
-                className="input-dark mt-1"
-                value={dataSource}
-                onChange={(e) => setDataSource(e.target.value as 'server' | 'local')}
-              >
-                <option value="server">服务器数据（网关 MT5 历史，推荐）</option>
-                <option
-                  value="local"
-                  disabled={!localCoverage?.enough}
-                  title={!localCoverage?.enough ? '本地无足够缓存：请先在行情页浏览该品种积累K线缓存' : ''}
-                >
-                  本地缓存数据{localCoverage ? `（${symbol} ${timeframe} · ${cachedBars.length} 根）` : '（无缓存）'}
-                </option>
-              </select>
-              {dataSource === 'local' && localCoverage && (
-                <span className="block mt-1 text-2xs text-blue-300">
-                  缓存覆盖：{localCoverage.first} ~ {localCoverage.last}
-                  {localCoverage.enough
-                    ? '。建议将回测区间设在覆盖范围内，区间外部分按交集执行。'
-                    : '。缓存不足 50 根，无法提交。'}
-                </span>
-              )}
-            </label>
-          </div>
-
+          {/* ── Step 4: 资金 / 杠杆 / 点差 / 滑点 ────────────────────────── */}
           <div className="grid grid-cols-4 gap-3">
             <label className="block">
               <span className="text-xs text-gray-400">初始资金</span>

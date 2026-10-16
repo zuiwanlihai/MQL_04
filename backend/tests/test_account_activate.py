@@ -46,6 +46,7 @@ class RecordingStub:
     unavailable: bool = False
     fail_health: bool = False
     health_account: dict | None = dict(RAW_LOGIN)
+    health_terminal: dict | None = {"connected": True, "trade_allowed": True}
 
     def __init__(self, base_url: str | None = None) -> None:
         self.base_url = base_url
@@ -75,9 +76,12 @@ class RecordingStub:
             from app.services.gateway_client import GatewayUnavailable
 
             raise GatewayUnavailable("行情网关不可达：stub down")
-        if RecordingStub.health_account is None:
-            return {}
-        return {"account": dict(RecordingStub.health_account)}
+        payload: dict = {}
+        if RecordingStub.health_account is not None:
+            payload["account"] = dict(RecordingStub.health_account)
+        if RecordingStub.health_terminal is not None:
+            payload["terminal"] = dict(RecordingStub.health_terminal)
+        return payload
 
     async def aclose(self) -> None:
         pass
@@ -94,6 +98,7 @@ def stub(monkeypatch):
     RecordingStub.unavailable = False
     RecordingStub.fail_health = False
     RecordingStub.health_account = dict(RAW_LOGIN)
+    RecordingStub.health_terminal = {"connected": True, "trade_allowed": True}
     monkeypatch.setattr(acc_mod, "GatewayClient", RecordingStub)
 
     class _Default:
@@ -379,6 +384,8 @@ def test_active_lists_current_login_per_node(client, stub, user):
     assert items[0]["node_name"] == "行情网关A"
     assert items[0]["account"]["login"] == 888001
     assert items[0]["account"]["account_type"] == "real"
+    # 终端按钮实况随 health.terminal 透传（顶栏徽标据此显示）
+    assert items[0]["terminal_trade_allowed"] is True
     # 探活打的是节点自己的 URL
     assert any(i.base_url == "http://10.8.8.6:8186" for i in stub.instances)
 
@@ -395,6 +402,7 @@ def test_active_node_unreachable_account_null(client, stub, user):
     assert len(items) == 1
     assert items[0]["node_id"] == node_id
     assert items[0]["account"] is None  # 离线节点 → null，前端显示离线
+    assert items[0]["terminal_trade_allowed"] is None  # 终端实况同样未知
 
 
 def test_active_no_accounts_returns_empty(client, stub, user):
@@ -438,4 +446,33 @@ def test_active_ea_bridge_node_synthesizes_from_row(client, stub, user):
     assert items[0]["node_name"] == "EA 桥节点"
     assert items[0]["account"]["login"] == 5040012345
     assert items[0]["account"]["account_type"] == "demo"
+    assert items[0]["terminal_trade_allowed"] is None  # EA 桥无法远程读终端按钮
     assert not stub.instances  # 未发起任何 HTTP 探活
+
+
+def test_active_reports_terminal_algo_off(client, stub, user):
+    """终端 AutoTrading 被关闭（或 MT5 重启归位）→ 实况如实上报 False。
+
+    平台开关（algo_trading_enabled）与终端按钮是两个独立状态：今天 21:51
+    的漂移场景就是平台=开、终端=关，徽标必须能显示「未开启」。
+    """
+    token, user_id = user
+    node_id = _seed_node(client, "10.8.8.8", 8188)
+    _seed_account(client, user_id, node_id)
+
+    stub.health_terminal = {"connected": True, "trade_allowed": False}
+    r = client.get(f"{API}/active", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["terminal_trade_allowed"] is False
+
+
+def test_active_terminal_state_null_when_gateway_omits(client, stub, user):
+    """网关负载无 terminal 段（老版本/异常）→ null，前端回退平台开关显示。"""
+    token, user_id = user
+    node_id = _seed_node(client, "10.8.8.9", 8189)
+    _seed_account(client, user_id, node_id)
+
+    stub.health_terminal = None
+    r = client.get(f"{API}/active", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["terminal_trade_allowed"] is None

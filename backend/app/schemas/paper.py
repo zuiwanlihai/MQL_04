@@ -22,8 +22,17 @@ Timeframe = Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
 
 class PaperCreate(BaseModel):
     strategy_id: uuid.UUID
-    account_id: uuid.UUID = Field(
-        description="绑定的 MT5 账户（M12）：虚拟下单行情/登录走该账户所在网关节点"
+    account_id: uuid.UUID | None = Field(
+        default=None,
+        description="gateway 模式必填：绑定的 MT5 账户（M12）；synthetic 模式忽略",
+    )
+    data_source: Literal["gateway", "synthetic"] = Field(
+        default="gateway",
+        description="行情来源：gateway=网关实时行情；synthetic=合成数据集回放",
+    )
+    synthetic_dataset_id: int | None = Field(
+        default=None, gt=0,
+        description="data_source=synthetic 时：SyntheticDataset 主键",
     )
     version: int | None = Field(
         default=None,
@@ -50,6 +59,12 @@ class PaperCreate(BaseModel):
             raise ValueError("启动虚拟下单前必须确认撮合档位的成交价构成假设")
         if self.spread_mode == "fixed" and self.spread_points is None:
             raise ValueError("固定点差模式必须提供 spread_points")
+        if self.data_source == "gateway":
+            if self.account_id is None:
+                raise ValueError("网关模式必须提供绑定的 MT5 账户 account_id")
+        elif self.data_source == "synthetic":
+            if self.synthetic_dataset_id is None:
+                raise ValueError("合成数据集模式必须提供 synthetic_dataset_id")
         return self
 
 
@@ -66,6 +81,8 @@ class PaperRunOut(BaseModel):
     strategy_id: uuid.UUID
     account_id: uuid.UUID | None
     strategy_version: int | None
+    data_source: Literal["gateway", "synthetic"]
+    synthetic_dataset_id: int | None
     status: PaperRunStatus
     execution_mode: PaperExecutionMode
     symbol: str

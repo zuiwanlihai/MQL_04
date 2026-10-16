@@ -190,6 +190,8 @@ export interface ActiveAccountInfo {
   node_id: string;
   node_name: string;
   account: AccountProbeResult | null;
+  /** 该节点 MT5 终端本体「算法交易」按钮实况（EA 桥/节点离线/后端未上报 = null） */
+  terminal_trade_allowed: boolean | null;
 }
 
 export interface ActiveAccountListResponse {
@@ -359,6 +361,16 @@ export interface StrategyTemplateSummary {
 export interface StrategyDetail extends Strategy {
   source_code: string;
   builder_config: BuilderConfig | null;
+  source_code_hash?: string | null;
+}
+
+export interface StrategyBuilderSave {
+  source_code: string;
+  builder_config: BuilderConfig;
+  direction?: StrategyDirection;
+  symbol_ids?: string[];
+  timeframe?: string;
+  base_updated_at?: string | null;
 }
 
 export interface StrategyCreate {
@@ -536,8 +548,9 @@ export interface BacktestCreate {
   timeframe: string;
   start_date: string;
   end_date: string;
-  data_source?: 'server' | 'local';
+  data_source?: 'server' | 'local' | 'synthetic';
   local_bars?: LocalBar[] | null;
+  synthetic_dataset_id?: number | null;
   initial_deposit: number;
   leverage: number;
   execution_mode: ExecutionMode;
@@ -567,6 +580,17 @@ export interface EquityPoint {
   baseline: number;
 }
 
+export interface StrategyScore {
+  score: number;
+  grade: 'S' | 'A' | 'B' | 'C' | 'D' | 'F';
+  grade_label: string;
+  credibility: number;
+  credibility_note: string;
+  dimensions: Record<string, number>;
+  highlights: string[];
+  shortcomings: string[];
+}
+
 export interface BacktestReport {
   id: string;
   task_id: string;
@@ -594,6 +618,7 @@ export interface BacktestReport {
   total_swap: number;
   equity_curve: EquityPoint[];
   monthly_returns: Record<string, number>;
+  score?: StrategyScore;
   generated_at: string;
 }
 
@@ -902,6 +927,8 @@ export interface PaperRun {
   strategy_id: string;
   account_id: string | null;
   strategy_version: number | null;
+  data_source: 'gateway' | 'synthetic';
+  synthetic_dataset_id: number | null;
   status: PaperRunStatus;
   execution_mode: PaperExecutionMode;
   symbol: string;
@@ -943,7 +970,10 @@ export interface PaperRunDetail extends PaperRun {
 
 export interface PaperCreate {
   strategy_id: string;
-  account_id: string;
+  /** gateway 模式必填；synthetic 模式不传 */
+  account_id?: string | null;
+  data_source?: 'gateway' | 'synthetic';
+  synthetic_dataset_id?: number | null;
   version?: number | null;
   symbol: string;
   timeframe: string;

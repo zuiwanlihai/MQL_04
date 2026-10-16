@@ -98,6 +98,11 @@ class ActiveAccountInfo(BaseModel):
     node_id: uuid.UUID
     node_name: str
     account: AccountProbeResult | None = None
+    terminal_trade_allowed: bool | None = Field(
+        default=None,
+        description="该节点 MT5 终端本体「算法交易」按钮实况（health.terminal.trade_allowed）；"
+        "EA 桥 / 节点不可达 / 网关未上报时为 null（前端回退到平台开关显示）",
+    )
 
 
 class ActiveAccountListResponse(BaseModel):

@@ -138,6 +138,150 @@ async def fetch_bars(
     return FetchedBars(arrays=arrays, warmup_bars=warmup_actual)
 
 
+# ---------------------------------------------------------------------------
+# Synthetic M1 → target timeframe aggregation
+# ---------------------------------------------------------------------------
+
+# 聚合用的周期秒数表（与 TF_SECONDS 一致 + 补 W1/MN 以覆盖所有前端生成场景）
+_AGG_TF_SECONDS: dict[str, int] = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400,
+    "D1": 86400, "W1": 604800, "MN": 2592000,
+}
+
+
+def aggregate_m1_to_tf(
+    m1_bars: list[dict], target_tf: str
+) -> list[dict]:
+    """把合成数据集的 M1 粒度 bars 聚合成目标周期。
+
+    m1_bars: SyntheticDataset.bars — [{time(epoch秒), open, high, low, close, volume}, ...]
+    返回: [{time, open, high, low, close, tick_volume}, ...]，与 bars_from_local 的
+    rows 入参格式完全对齐（volume → tick_volume 字段重命名）。
+
+    固定分钟类（M5/M15/M30/H1/H4）：按连续 N 根 M1 分组；尾组不足 N 根丢弃，
+    与前端 TypeScript aggregateCandles 行为一致，避免产生残缺 bar 污染回测。
+    日历类（D1/W1/MN）：按自然日/ISO 周/自然月边界切分，整组入桶，允许残缺
+    尾组（最后一日的 M1 不到 24 小时也必须成为当日 D1 bar）。
+
+    排序/去重：输入 m1_bars 假设是升序且唯一的（前端生成器已保证），本函数仍
+    执行 time 排序 + 去重以对齐 bars_from_local 的稳健性。
+    """
+    if target_tf == "M1":
+        # 直返 — 仅做脏行过滤 + 字段对齐（volume → tick_volume）
+        return _sanitize_m1(m1_bars)
+
+    if target_tf not in _AGG_TF_SECONDS:
+        raise DataUnavailableError(f"不支持的聚合目标周期：{target_tf}")
+
+    # 1. 清洗 + 排序去重
+    m1 = _sanitize_m1(m1_bars)
+    if len(m1) < 2:
+        raise DataUnavailableError(
+            f"M1 数据不足（{len(m1)} 根），无法聚合到 {target_tf}"
+        )
+
+    tf_seconds = _AGG_TF_SECONDS[target_tf]
+
+    # 2. 判断聚合策略
+    calendar_tfs = {"D1", "W1", "MN"}
+    if target_tf in calendar_tfs:
+        return _aggregate_calendar(m1, target_tf)
+    else:
+        bars_per_group = tf_seconds // 60  # M5→5, H1→60, H4→240
+        return _aggregate_fixed(m1, bars_per_group)
+
+
+def _sanitize_m1(bars: list[dict]) -> list[dict]:
+    """清洗 M1 bars：脏行丢弃、排序去重、volume→tick_volume 字段重命名。"""
+    seen: set[int] = set()
+    cleaned: list[dict] = []
+    for r in bars:
+        t = int(r.get("time", 0))
+        if t <= 0 or t in seen:
+            continue
+        try:
+            o = float(r["open"])
+            h = float(r["high"])
+            lo = float(r["low"])
+            c = float(r["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(x == x and abs(x) < 1e12 for x in (o, h, lo, c)):
+            continue  # NaN / inf
+        if h < lo or h < max(o, c) - 1e-9 or lo > min(o, c) + 1e-9:
+            continue
+        seen.add(t)
+        cleaned.append({
+            "time": t,
+            "open": o, "high": h, "low": lo, "close": c,
+            "tick_volume": int(r.get("volume", r.get("tick_volume", 0)) or 0),
+        })
+    cleaned.sort(key=lambda b: b["time"])
+    return cleaned
+
+
+def _aggregate_fixed(m1: list[dict], bars_per_group: int) -> list[dict]:
+    """固定分钟周期聚合：连续 bars_per_group 根 M1 归并。尾组不足时丢弃。"""
+    result: list[dict] = []
+    n = len(m1)
+    for i in range(0, n - bars_per_group + 1, bars_per_group):
+        bucket = m1[i : i + bars_per_group]
+        first, last = bucket[0], bucket[-1]
+        group_high = max(b["high"] for b in bucket)
+        group_low = min(b["low"] for b in bucket)
+        group_vol = sum(b["tick_volume"] for b in bucket)
+        result.append({
+            "time": first["time"],
+            "open": first["open"],
+            "high": group_high,
+            "low": group_low,
+            "close": last["close"],
+            "tick_volume": group_vol,
+        })
+    return result
+
+
+def _calendar_key(epoch: int, tf: str) -> str:
+    """返回 epoch 秒所在日历桶的 key。"""
+    from datetime import UTC, datetime as _dt
+
+    d = _dt.fromtimestamp(epoch, tz=UTC)
+    if tf == "D1":
+        return d.strftime("%Y-%m-%d")
+    if tf == "W1":
+        # ISO 周：以周一为起点
+        monday = d - _dt(d.year, d.month, d.day, tzinfo=UTC).weekday()
+        return monday.strftime("%Y-%m-%d")
+    if tf == "MN":
+        return d.strftime("%Y-%m")
+    raise ValueError(f"未知日历周期: {tf}")
+
+
+def _aggregate_calendar(m1: list[dict], tf: str) -> list[dict]:
+    """日历周期聚合：按自然日/ISO 周/自然月切分，允许残缺尾组。"""
+    from collections import defaultdict
+
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for bar in m1:
+        key = _calendar_key(bar["time"], tf)
+        buckets[key].append(bar)
+
+    result: list[dict] = []
+    for key in sorted(buckets):  # 字符串排序在 YYYY-MM-DD / YYYY-MM 格式下天然正确
+        bucket = buckets[key]
+        first, last = bucket[0], bucket[-1]
+        result.append({
+            "time": first["time"],
+            "open": first["open"],
+            "high": max(b["high"] for b in bucket),
+            "low": min(b["low"] for b in bucket),
+            "close": last["close"],
+            "tick_volume": sum(b["tick_volume"] for b in bucket),
+        })
+    return result
+
+
 def bars_from_local(
     rows: list[dict],
     start: datetime,

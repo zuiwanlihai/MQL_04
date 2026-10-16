@@ -72,13 +72,28 @@ async def reconcile_once() -> dict[str, int]:
 
     for account_id in account_ids:
         client = GatewayClient.for_registered_node(node_url[account_id] or None)
+        mgr = None  # None if the manager singleton isn't yet importable/ready
         try:
+            # ── Step 1: flush poll mirror to DB (closes root-cause-1 race) ──
+            # Must happen BEFORE we fetch real positions so both snapshots are
+            # aligned to the same logical moment.
+            try:
+                from app.services.live.manager import get_live_manager  # noqa: WPS433
+                mgr = get_live_manager()
+                flushed = await mgr.flush_positions_for_account(str(account_id))
+                if flushed:
+                    logger.debug("reconcile %s: flushed %d handle(s) before compare",
+                                 account_id, flushed)
+            except Exception:  # noqa: BLE001 — flush failure must NOT kill reconcile
+                logger.exception("reconcile %s: flush_positions_for_account failed, "
+                                 "continuing with unflushed DB snapshot", account_id)
+
+            # ── Step 2: fetch real positions from the gateway ──
             try:
                 real = await client.positions()
             except GatewayError as exc:
                 logger.warning("reconcile %s: gateway unreachable: %s",
                                account_id, exc.detail)
-                # P0-4 零观测缺口：reconcile 循环静默跳过网关不可达
                 try:
                     await gate_fault(
                         fault_type=FaultType.GATEWAY_DISCONNECTED,
@@ -88,7 +103,13 @@ async def reconcile_once() -> dict[str, int]:
                     ).emit(db=None, level="warn")
                 except Exception:  # noqa: BLE001 — emit 不能阻断对账循环
                     logger.exception("reconcile gateway-unreachable fault emit failed")
+                # TODO(deferred): 这里 continue 跳过了 reconcile_pending 清理。
+                # 如果网关长期不可用，pending 会在 DB 中残留并在前端 dashboard
+                # 显示"待对账"。poll 从不碰 pending（设计意图：pending 表示"需要
+                # reconcile 收敛"），所以 reconcile 是唯一清理者。考虑此处也
+                # 清 pending 或至少打 warn 日志让运维知道残留原因。
                 continue
+
             async with AsyncSessionLocal() as db:
                 runs = (await db.execute(
                     select(LiveRun).where(
@@ -97,13 +118,89 @@ async def reconcile_once() -> dict[str, int]:
                     )
                 )).scalars().all()
                 mirrored = [p for r in runs for p in (r.positions or [])]
-                # ownership: only compare tickets tagged with these runs' magic
                 magics = {r.magic for r in runs}
                 real_mine = [p for p in real if int(p.get("magic", 0)) in magics]
                 mirrored_mine = [p for p in mirrored
                                  if int(p.get("magic", 0)) in magics]
                 diff = _tickets(real_mine) ^ _tickets(mirrored_mine)
                 result[str(account_id)] = len(diff)
+
+                # ── Step 3: diff? Try to auto-converge first (root-cause-3) ──
+                # If the broker-side terminal changed (user manually closed a
+                # position, broker abnormal close, etc.) the poll mirror simply
+                # hasn't caught up yet.  Instead of freezing outright, give
+                # the manager a chance to refresh its in-memory mirror from
+                # the SAME gateway client we just used for ``real``, force-
+                # write to DB, and re-check.  Only a diff that survives this
+                # reconciliation-on-the-fly is a true anomaly (e.g. a
+                # position the broker shows but the platform has never known
+                # about — possible magic collision).
+                if diff and mgr is not None:
+                    refresh = await mgr.force_refresh_account(
+                        str(account_id), client=client,
+                    )
+                    # Gateway down on every handle — Step2 succeeded with this
+                    # same client a moment ago, so we know it's transient.
+                    # Skip freezing and let the next cycle retry.
+                    if refresh.get("gateway_down"):
+                        logger.warning(
+                            "reconcile %s: gateway DOWN during force_refresh — "
+                            "skipping freeze, deferring to next cycle",
+                            account_id,
+                        )
+                        continue
+                    if refresh.get("ok"):
+                        # Read DB again after the forced refresh.
+                        db.expire_all()
+                        runs = (await db.execute(
+                            select(LiveRun).where(
+                                LiveRun.account_id == account_id,
+                                LiveRun.status.in_(["running", "paused", "stopping"]),
+                            )
+                        )).scalars().all()
+                        mirrored = [p for r in runs for p in (r.positions or [])]
+                        mirrored_mine = [p for p in mirrored
+                                         if int(p.get("magic", 0)) in magics]
+                        diff = _tickets(real_mine) ^ _tickets(mirrored_mine)
+                        result[str(account_id)] = len(diff)
+                        if not diff:
+                            logger.info(
+                                "reconcile %s: auto-converged after mirror refresh "
+                                "(%d recovered from poll lag)",
+                                account_id, len(real_mine) - len(mirrored_mine),
+                            )
+                            # Diff resolved — record a soft event but DO NOT
+                            # freeze.  Clear reconcile_pending (if any was set
+                            # earlier from a timed-out order that poll caught).
+                            # TODO(deferred): Step3 成功后和下面 Step4 的 pending
+                            # 清理完全相同的代码块（L173-L176 vs L205-L208），
+                            # 应抽取为 _clear_pending(db, runs) 辅助函数。
+                            for r in runs:
+                                if r.reconcile_pending:
+                                    r.reconcile_pending = False
+                                    db.add(r)
+                            await db.commit()
+                            continue
+                        # Diff persists even after forced refresh → real problem.
+                        logger.warning(
+                            "reconcile %s: auto-converge FAILED — diff=%s persists "
+                            "after refresh; freezing as anomaly",
+                            account_id, sorted(diff),
+                        )
+                    else:
+                        # ok=False + not gateway_down + handles=0 → Step2 proved
+                        # the gateway is alive, so this diff between the stale DB
+                        # mirror and the live gateway IS real.  Continue to
+                        # freeze (don't skip like we do for gateway_down).
+                        logger.info(
+                            "reconcile %s: force_refresh ok=False (handles=%d) — "
+                            "DB mirror is stale, gateway is live → diff is real; "
+                            "proceeding to freeze",
+                            account_id, refresh.get("handles", 0),
+                        )
+                        # fall through to freeze block below
+
+                # ── Step 4: no diff (or survived retry) ──
                 if not diff:
                     # converge any unknown-state orders (timed-out RPCs)
                     for r in runs:

@@ -32,6 +32,7 @@ from app.models import (
     PaperTrade,
     Strategy,
     StrategyVersion,
+    SyntheticDataset,
 )
 from app.sandbox.payload import describe_execution_mode
 from app.schemas.paper import (
@@ -118,25 +119,41 @@ async def create_paper_run(
         raise HTTPException(status_code=409, detail="已归档策略不可启动虚拟下单")
 
     # M12: the run must bind an MT5 account it can route its gateway calls to.
-    acct = await db.get(MT5Account, payload.account_id)
-    if acct is None or (str(acct.user_id) != current["sub"] and acct.user_id is not None):
-        raise HTTPException(status_code=404, detail="MT5 账户不存在")
+    acct = None
+    if payload.data_source == "gateway":
+        assert payload.account_id is not None  # schema 已校验
+        acct = await db.get(MT5Account, payload.account_id)
+        if acct is None or (str(acct.user_id) != current["sub"] and acct.user_id is not None):
+            raise HTTPException(status_code=404, detail="MT5 账户不存在")
 
-    # 虚拟下单/实盘互斥（后端双保险）：虚拟下单仅限模拟账户。
-    # ① 绑定行类型；② 节点当前登录实况（探活不可达时跳过，由 ① 兜底）。
-    if acct.account_type != "demo":
-        raise HTTPException(
-            status_code=409,
-            detail="虚拟下单仅支持模拟账户，当前绑定的是实盘账户；"
-            "请先在总览页切换登录到模拟账户",
-        )
-    if await probe_active_account_type(db, acct.gateway_node_id) == "real":
-        raise HTTPException(
-            status_code=409,
-            detail="虚拟下单仅支持模拟账户，当前登录的是实盘账户；"
-            "请先在总览页切换登录到模拟账户",
-        )
+        # 虚拟下单/实盘互斥（后端双保险）：虚拟下单仅限模拟账户。
+        # ① 绑定行类型；② 节点当前登录实况（探活不可达时跳过，由 ① 兜底）。
+        if acct.account_type != "demo":
+            raise HTTPException(
+                status_code=409,
+                detail="虚拟下单仅支持模拟账户，当前绑定的是实盘账户；"
+                "请先在总览页切换登录到模拟账户",
+            )
+        if await probe_active_account_type(db, acct.gateway_node_id) == "real":
+            raise HTTPException(
+                status_code=409,
+                detail="虚拟下单仅支持模拟账户，当前登录的是实盘账户；"
+                "请先在总览页切换登录到模拟账户",
+            )
+    else:
+        # synthetic 模式：校验合成数据集存在即可，不需要网关账户
+        assert payload.data_source == "synthetic"  # schema 已校验
+        assert payload.synthetic_dataset_id is not None
+        ds = await db.get(SyntheticDataset, payload.synthetic_dataset_id)
+        if ds is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"合成数据集 #{payload.synthetic_dataset_id} 不存在",
+            )
+        # symbol 统一为数据集自带的（合成数据不会跨品种）
+        symbol = ds.symbol
 
+    # Concurrency cap: active = running + paused + pending.
     version = payload.version
     if version is None:
         source = strategy.source_code
@@ -183,17 +200,32 @@ async def create_paper_run(
         "strategy_version": version,
         "source_hash": _source_hash(source),
         "sdk": _dependency_versions(),
-        "account": {"id": str(acct.id), "login": acct.login,
-                    "server": acct.server},
+        "data_source": payload.data_source,
     }
+    if payload.data_source == "gateway":
+        assert acct is not None
+        snapshot["account"] = {"id": str(acct.id), "login": acct.login,
+                                "server": acct.server}
+        run_symbol = payload.symbol
+        run_account_id = payload.account_id
+        run_dataset_id = None
+    else:
+        assert payload.data_source == "synthetic"
+        snapshot["synthetic_dataset_id"] = payload.synthetic_dataset_id
+        run_symbol = symbol  # synthetic 模式下 symbol 统一为数据集自带
+        run_account_id = None
+        run_dataset_id = payload.synthetic_dataset_id
+
     run = PaperRun(
         user_id=user_id,
         strategy_id=payload.strategy_id,
-        account_id=payload.account_id,
+        account_id=run_account_id,
         source_code=source,
         strategy_version=version,
-        symbol=payload.symbol,
+        symbol=run_symbol,
         timeframe=payload.timeframe,
+        data_source=payload.data_source,
+        synthetic_dataset_id=run_dataset_id,
         execution_mode=payload.execution_mode,
         initial_deposit=_dec(payload.initial_deposit),
         leverage=payload.leverage,

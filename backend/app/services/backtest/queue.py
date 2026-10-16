@@ -40,14 +40,17 @@ from app.models import (
     BacktestTrade,
     KlineCache,
     StrategyVersion,
+    SyntheticDataset,
 )
 from app.sandbox.matching import TF_SECONDS
 from app.sandbox.payload import BacktestPayload, save_payload
 from app.services.backtest.data_fetcher import (
     DataUnavailableError,
+    aggregate_m1_to_tf,
     bars_from_local,
     fetch_bars,
 )
+from app.services.synthetic.generator import load_synthetic_bars
 from app.services.backtest.supervisor import (
     TERM_CANCELLED,
     TERM_CRASH,
@@ -241,34 +244,59 @@ class BacktestQueue:
             task_id_str = str(task_id)
             payload_dir = Path(settings.BACKTEST_RUNTIME_DIR) / task_id_str
 
-        # 2. gateway data + symbol info
+        # 2. 取 symbol_info + bars — 按 data_source 路由
+        data_source = task.data_source or "mt5"
+        uses_gateway = data_source not in ("synthetic", "local")
         client = GatewayClient()
         try:
-            try:
-                symbols = await client.symbols()
-            except GatewayError as exc:
-                await self._safe_fail(task_id, "UNKNOWN_ERROR", f"网关不可达：{exc.detail}")
-                return
-            info = next(
-                (s for s in symbols if s.get("name", "").upper() == task.symbol.upper()),
-                None,
-            )
-            if info is None:
-                await self._safe_fail(
-                    task_id, "INVALID_SYMBOL", f"网关不存在品种：{task.symbol}"
+            # ── Gateway symbol info 只在 live / mt5 路径需要 ──
+            # synthetic / local 数据源完全不依赖 MT5 gateway：
+            #   - bars 来自 Parquet / JSONB (synthetic) 或 KlineCache (local)
+            #   - symbol_info 用合理默认值构造（XAUUSD / EURUSD 等常见品种）
+            info: dict
+            if uses_gateway:
+                try:
+                    symbols = await client.symbols()
+                except GatewayError as exc:
+                    await self._safe_fail(task_id, "UNKNOWN_ERROR", f"网关不可达：{exc.detail}")
+                    return
+                info = next(
+                    (s for s in symbols if s.get("name", "").upper() == task.symbol.upper()),
+                    None,
                 )
-                return
+                if info is None:
+                    await self._safe_fail(
+                        task_id, "INVALID_SYMBOL", f"网关不存在品种：{task.symbol}"
+                    )
+                    return
+            else:
+                # 合成数据 / 本地缓存 → 从 task 的 symbol 构造合理默认合约参数
+                # （沙箱 engine.py 已有 fallback 兜底，这些值用于 swap/point/digits 等）
+                info = _default_symbol_info(task.symbol)
+
             try:
-                if task.data_source == "local":
-                    # 本地数据来源：优先读全局共享K线缓存表（kline_cache），
-                    # 缓存无此条时回退到创建时落盘的 local_bars.json（旧任务）。
-                    # symbol_info 等合约参数仍取自网关快照。
+                if data_source == "local":
                     rows = await self._load_cache_bars(task.symbol, task.timeframe)
                     if rows is None:
                         bars_file = payload_dir / "local_bars.json"
                         rows = json.loads(bars_file.read_text(encoding="utf-8"))
                     fetched = bars_from_local(
                         rows, task.start_date, task.end_date,
+                        task.timeframe, task.warmup_bars,
+                    )
+                elif data_source == "synthetic":
+                    async with AsyncSessionLocal() as s:
+                        ds = await s.get(SyntheticDataset, task.synthetic_dataset_id)
+                    if ds is None:
+                        await self._safe_fail(task_id, "DATA_UNAVAILABLE",
+                            f"合成数据集 #{task.synthetic_dataset_id} 不存在")
+                        return
+                    m1_bars = load_synthetic_bars(
+                        ds, runtime_dir=settings.SYNTHETIC_RUNTIME_DIR,
+                    )
+                    aggregated = aggregate_m1_to_tf(m1_bars, task.timeframe)
+                    fetched = bars_from_local(
+                        aggregated, task.start_date, task.end_date,
                         task.timeframe, task.warmup_bars,
                     )
                 else:
@@ -324,7 +352,8 @@ class BacktestQueue:
                         await db.commit()
                 return
         finally:
-            await client.aclose()
+            if uses_gateway:
+                await client.aclose()
 
         # 4. spawn + stream + persist
         sup = RunnerSupervisor(task_id_str, payload_dir)
@@ -668,6 +697,75 @@ class _StreamState:
 
 def _cleanup(directory: Path) -> None:
     shutil.rmtree(directory, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic / local 数据源的合约默认值（无需 MT5 gateway）
+# ---------------------------------------------------------------------------
+
+_XAUUSD_DEFAULTS = {
+    "name": "XAUUSD", "description": "Gold Spot / U.S. Dollar",
+    "path": "Metals", "currency_base": "XAU", "currency_profit": "USD",
+    "digits": 2, "point": 0.01, "trade_contract_size": 100.0,
+    "trade_mode": 4, "spread": 30, "spread_raw": 30, "volume_step": 0.01,
+    "volume_min": 0.01, "volume_max": 100.0,
+    "margin_initial": 0.0, "margin_maintenance": 0.0,
+    "swap_long": -0.3, "swap_short": -0.1, "swap_mode": 1,
+}
+
+_EURUSD_DEFAULTS = {
+    "name": "EURUSD", "description": "Euro vs US Dollar",
+    "path": "FX", "currency_base": "EUR", "currency_profit": "USD",
+    "digits": 5, "point": 0.00001, "trade_contract_size": 100000.0,
+    "trade_mode": 4, "spread": 15, "spread_raw": 15, "volume_step": 0.01,
+    "volume_min": 0.01, "volume_max": 100.0,
+    "margin_initial": 0.0, "margin_maintenance": 0.0,
+    "swap_long": -0.1, "swap_short": -0.2, "swap_mode": 1,
+}
+
+_FX_COMMON_DEFAULTS = {
+    "name": None, "description": None, "path": "FX",
+    "currency_base": None, "currency_profit": "USD",
+    "digits": 5, "point": 0.00001, "trade_contract_size": 100000.0,
+    "trade_mode": 4, "spread": 20, "spread_raw": 20, "volume_step": 0.01,
+    "volume_min": 0.01, "volume_max": 100.0,
+    "margin_initial": 0.0, "margin_maintenance": 0.0,
+    "swap_long": -0.1, "swap_short": -0.1, "swap_mode": 1,
+}
+
+_FALLBACK_DEFAULTS = {
+    "name": None, "description": None, "path": "",
+    "currency_base": "USD", "currency_profit": "USD",
+    "digits": 5, "point": 0.00001, "trade_contract_size": 100000.0,
+    "trade_mode": 4, "spread": 20, "spread_raw": 20, "volume_step": 0.01,
+    "volume_min": 0.01, "volume_max": 100.0,
+    "margin_initial": 0.0, "margin_maintenance": 0.0,
+    "swap_long": 0.0, "swap_short": 0.0, "swap_mode": 1,
+}
+
+
+def _default_symbol_info(symbol: str) -> dict:
+    """为 synthetic / local 数据源构造合理的合约默认值。
+
+    已知品种有专用预设；其他品种用 FX 通用模板（digits=5, point=0.00001）。
+    返回的 dict 字段与 MT5 gateway ``symbols()`` 返回的单条一致，
+    可以直接传给 :meth:`BacktestQueue._build_payload`。
+    """
+    sym_upper = symbol.upper().strip()
+
+    if sym_upper == "XAUUSD":
+        info = dict(_XAUUSD_DEFAULTS)
+    elif sym_upper == "EURUSD":
+        info = dict(_EURUSD_DEFAULTS)
+    elif sym_upper.endswith("USD") and len(sym_upper) <= 7:  # 如 GBPUSD, USDJPY, AUDUSD
+        info = dict(_FX_COMMON_DEFAULTS)
+    else:
+        info = dict(_FALLBACK_DEFAULTS)
+
+    info["name"] = sym_upper
+    info["description"] = f"{sym_upper} (synthetic)"
+    info["currency_base"] = sym_upper[:3] if len(sym_upper) >= 3 else sym_upper
+    return info
 
 
 # ── singleton ──────────────────────────────────────────────────

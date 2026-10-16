@@ -22,8 +22,9 @@ def _grid_occupied(ctx, side, poss, anchor, step):
     - 持仓出现在账户镜像后，与待绑定档位一对一配对（各自按价格/档位排序对齐），
       记入 grid_<side>_map（pos_id → level）；
     - 持仓消失（网格平仓 / 手动平仓 / 强平）即释放档位，允许再次开出；
-    - 镜像滞后保护：持仓数 < 已登记数（含待绑定）说明下单后的仓位尚未出现在
-      账户镜像里，保留待绑定档位，防止下一根 K 线重复开仓。
+    - 残留档位清理：配对 + 自愈之后若 pending 仍非空，paper/backtest 模式立即清
+      除（同步引擎下单后持仓立即可见，残留一定来自已平仓档位）；live 模式保守保留
+      至少 1 根 bar（给券商镜像同步留窗口，防止 RPC 往返期间档位被误判为空闲）。
 
     无档位可配对的存量仓位（升级 / 重启后 storage 缺档位登记）按最低空闲档位
     登记，保证升级后不重复开仓。
@@ -80,9 +81,28 @@ def _grid_occupied(ctx, side, poss, anchor, step):
         if lv in pending:
             pending.remove(lv)
 
-    # 镜像滞后保护（见 docstring）：仓位尚未出现在镜像时保留 pending
-    if len(poss) >= len(slot) + len(pending):
-        pending = []
+    # 镜像滞后保护 + 残留档位清理：
+    # 配对 + 自愈登记之后，所有 poss 中的持仓都已绑定到 slot（len(poss) == len(slot)）。
+    # 若此时 pending 非空，说明 fired 中残留的档位没有对应持仓（持仓已被平掉但 fired
+    # 未清，或 fired 混入了未成交档位），必须清掉以免永久阻塞同档位重新开仓。
+    #
+    # 但 live 模式不同步：下单后持仓可能还没从券商镜像拉回来（RPC 往返需要时间），
+    # 此时 fired=[1] 但 poss=0 是正常的镜像滞后，不能立即清 pending，否则 mirror 同步
+    # 回来前档位会变成空闲，导致重复下单。
+    #
+    # 因此分两种模式：
+    #   paper / backtest: len(poss) == len(slot) → 清 pending（同步，下单即见持仓）
+    #   live:            len(poss) >= len(slot) + len(pending) → 清 pending（保守，留镜像滞后窗口）
+    #
+    # 原条件 len(poss) >= len(slot) + len(pending) 过于宽松，paper 模式下当 poss=0、
+    # slot=0、pending=1 时判定为 False 而残留 pending，导致档位永久占用。
+    is_sync = getattr(ctx, "mode", "backtest") != "live"
+    if is_sync:
+        if len(poss) == len(slot):
+            pending = []
+    else:
+        if len(poss) >= len(slot) + len(pending):
+            pending = []
 
     ctx.storage[fired_key] = pending
     ctx.storage[map_key] = slot
@@ -101,6 +121,7 @@ def on_init(ctx):
             "grid_step": 200,        # 网格间距（点）：EURUSD 200点=0.0020，XAUUSD 200点=2.00
             "max_levels": 5,         # max grid entries PER SIDE (buy / sell)
             "volume": 0.1,
+            "anchor_reset_secs": 0,  # 锚点重置间隔（秒）：0=永不重置；3600=每1小时
         },
     )
     # Restore the anchor across restarts; plain variables are NOT recovered.
@@ -108,6 +129,7 @@ def on_init(ctx):
         quote = ctx.get_quote(ctx.symbol)
         if quote is not None:
             ctx.storage["anchor"] = quote.bid
+        ctx.storage["last_reset_ts"] = None
 
 
 def on_bar(ctx, bar):
@@ -118,6 +140,7 @@ def on_bar(ctx, bar):
     step = ctx.params["grid_step"] * point
     max_levels = ctx.params["max_levels"]
     volume = ctx.params["volume"]
+    reset_secs = ctx.params.get("anchor_reset_secs", 0)
 
     anchor = ctx.storage.get("anchor")
     if anchor is None:
@@ -126,9 +149,28 @@ def on_bar(ctx, bar):
             ctx.storage["anchor"] = quote.bid
         return
 
+    # 锚点定时重置：每 N 秒把 anchor 挪到当前 bar.close，
+    # 并清空 fired/map 让档位编号在新锚点下重新可用。
+    # 已持仓的平仓用 pos.open_price ± step，与锚点和档位编号无关，
+    # 清空 fired/map 完全不影响旧单止盈。
+    if reset_secs > 0:
+        now_ts = bar.time.timestamp() if hasattr(bar.time, "timestamp") else bar.time
+        last_ts = ctx.storage.get("last_reset_ts")
+        if last_ts is None or (now_ts - last_ts) >= reset_secs:
+            ctx.log.info(
+                f"GRID anchor reset: {anchor:.5f} -> {bar.close:.5f} "
+                f"(interval={reset_secs}s)"
+            )
+            ctx.storage["anchor"] = bar.close
+            ctx.storage["last_reset_ts"] = now_ts
+            ctx.storage["grid_buy_fired"] = []
+            ctx.storage["grid_sell_fired"] = []
+            ctx.storage["grid_buy_map"] = {}
+            ctx.storage["grid_sell_map"] = {}
+            anchor = bar.close
+
+    # 快照 1：平仓循环用（遍历用旧快照，平仓会同步改 account.positions）
     positions = ctx.get_positions()
-    buy_poss = [p for p in positions if p.direction == "buy"]
-    sell_poss = [p for p in positions if p.direction == "sell"]
 
     # Exit: long closed one grid step above its entry, short one step below.
     for pos in positions:
@@ -142,6 +184,13 @@ def on_bar(ctx, bar):
             result = ctx.close(pos.id)
             if not result.success:
                 ctx.log.warn(f"Close failed: {result.error_code} - {result.error_message}")
+
+    # 快照 2：开仓判断用 —— 必须在平仓之后重新获取，否则：
+    # 1) _grid_occupied 用过期快照做 live_ids，已平仓的档位不会被释放
+    # 2) len(buy_poss) 会偏大，导致 "持仓已满" 的假阴性判断
+    positions = ctx.get_positions()
+    buy_poss = [p for p in positions if p.direction == "buy"]
+    sell_poss = [p for p in positions if p.direction == "sell"]
 
     # Entry (long): buy one level below anchor when that level is not occupied.
     # 档位占用去重：已开且未释放的档位不再开 —— 实盘成交价偏离目标价也不会重复开仓

@@ -375,41 +375,37 @@ export default function RiskPage() {
                     {a.login} · {a.name || a.server}
                   </p>
                   <p className="text-xs text-gray-500 mt-1">
-                    对账不一致已冻结自动交易，需管理员复核后解冻（UNFREEZE 二次确认 + 审计）。
+                    对账不一致已冻结自动交易，账户所有者或管理员可解除（UNFREEZE 二次确认 + 审计留痕）。
                   </p>
-                  {isAdmin ? (
-                    unfreezeTarget === a.id ? (
-                      <div className="mt-2 space-y-2">
-                        <input
-                          className="input-dark"
-                          placeholder="复核意见（≥8 字，审计留痕）"
-                          value={unfreezeNote}
-                          onChange={(e) => setUnfreezeNote(e.target.value)}
-                        />
-                        <div className="flex gap-2">
-                          <button
-                            type="button"
-                            className="btn-danger"
-                            disabled={unfreeze.isPending || unfreezeNote.trim().length < 8}
-                            onClick={() =>
-                              unfreeze.mutate(
-                                { id: a.id, note: unfreezeNote.trim() },
-                                { onSuccess: () => { setUnfreezeTarget(null); setUnfreezeNote(''); } },
-                              )
-                            }
-                          >
-                            确认解冻（UNFREEZE）
-                          </button>
-                          <button type="button" className="btn-ghost" onClick={() => setUnfreezeTarget(null)}>取消</button>
-                        </div>
+                  {unfreezeTarget === a.id ? (
+                    <div className="mt-2 space-y-2">
+                      <input
+                        className="input-dark"
+                        placeholder="复核意见（≥8 字，审计留痕）"
+                        value={unfreezeNote}
+                        onChange={(e) => setUnfreezeNote(e.target.value)}
+                      />
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          className="btn-danger"
+                          disabled={unfreeze.isPending || unfreezeNote.trim().length < 8}
+                          onClick={() =>
+                            unfreeze.mutate(
+                              { id: a.id, note: unfreezeNote.trim() },
+                              { onSuccess: () => { setUnfreezeTarget(null); setUnfreezeNote(''); } },
+                            )
+                          }
+                        >
+                          确认解冻（UNFREEZE）
+                        </button>
+                        <button type="button" className="btn-ghost" onClick={() => setUnfreezeTarget(null)}>取消</button>
                       </div>
-                    ) : (
-                      <button type="button" className="btn-secondary mt-2" onClick={() => setUnfreezeTarget(a.id)}>
-                        复核并解冻
-                      </button>
-                    )
+                    </div>
                   ) : (
-                    <p className="text-xs text-gray-600 mt-2">仅管理员可执行解冻。</p>
+                    <button type="button" className="btn-secondary mt-2" onClick={() => setUnfreezeTarget(a.id)}>
+                      解除冻结
+                    </button>
                   )}
                 </div>
               ))

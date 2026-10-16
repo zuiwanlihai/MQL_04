@@ -3,7 +3,6 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import {
   BarChart3,
   Bell,
-  CandlestickChart,
   Code2,
   FlaskConical,
   LayoutDashboard,
@@ -43,9 +42,10 @@ const BASE_NAV: NavItem[] = [
   { label: '策略市场', to: '/marketplace', icon: Store },
   { label: '回测', to: '/backtest', icon: BarChart3 },
   { label: '研究笔记', to: '/notebooks', icon: NotebookPen },
-  { label: '虚拟下单', to: '/trading/paper', icon: CandlestickChart },
   { label: '模拟盘交易', to: '/trading/live-demo', icon: FlaskConical },
 ];
+// 虚拟下单已合并到「回测中心」tab（BacktestListPage 的 paper tab），侧栏独立入口移除。
+// 路由 /trading/paper 保留（兼容直接访问），路由内部自动重定向到 /backtest?tab=paper。
 const LIVE_NAV: NavItem = { label: '实盘', to: '/trading/live', icon: Zap };
 // 手动交易独立入口已取消 — 面板分别嵌入虚拟下单、模拟盘交易、实盘、行情页面（ManualTradePanel）。
 

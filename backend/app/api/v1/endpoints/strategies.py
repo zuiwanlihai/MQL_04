@@ -12,6 +12,7 @@ refuses to freeze error-level code (422 with the ValidationResult body).
 
 from __future__ import annotations
 
+import hashlib
 import math
 import uuid
 from datetime import datetime
@@ -23,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from app.dependencies import CurrentUser, DBSession
 from app.models import Strategy, StrategyTemplate, StrategyVersion
 from app.schemas.strategy import (
+    StrategyBuilderSave,
     StrategyCreate,
     StrategyDetailOut,
     StrategyListResponse,
@@ -37,11 +39,49 @@ from app.schemas.strategy import (
     VersionCreate,
     VersionListResponse,
 )
+from app.services.builder_validator import validate_builder_config
 from app.services.strategy_validator import validate_source
 
 router = APIRouter()
 
 _PAGE_SIZE_MAX = 100
+
+
+def _source_hash(source: str) -> str:
+    """SHA-256 hex of source_code — used for divergence detection."""
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+async def _check_optimistic(
+    strategy: Strategy, base_updated_at: datetime | None,
+) -> None:
+    if base_updated_at is not None:
+        if strategy.updated_at is not None and base_updated_at != strategy.updated_at:
+            raise HTTPException(
+                status_code=409, detail="策略已在其他窗口被修改，请刷新后重试"
+            )
+
+
+def _raise_bad_builder(errors: list[dict]) -> None:
+    """把 DSL 校验错误列表转为 422（前端友好，含 targetId 定位）。"""
+    if errors:
+        raise HTTPException(
+            status_code=422,
+            detail={"type": "builder_config", "errors": errors},
+        )
+
+
+def _raise_bad_source_if_error(source: str) -> None:
+    """AST 校验：error 级直接拒绝保存；warning 级放行。"""
+    report = validate_source(source)
+    if not report.ok:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "type": "source_code",
+                "issues": [i.model_dump() for i in report.issues],
+            },
+        )
 
 
 async def _get_owned(
@@ -111,6 +151,12 @@ async def create_strategy(
     elif payload.source_code is not None:
         # 可视化构建器路径：以生成源码初始化工作副本
         source = payload.source_code
+
+    # P1：服务端 DSL + AST 校验（防御性校验，前端已做一轮）
+    if payload.builder_config is not None:
+        _raise_bad_builder(validate_builder_config(payload.builder_config))
+    if source:
+        _raise_bad_source_if_error(source)
 
     user_id = uuid.UUID(current["sub"])
     strategy = Strategy(
@@ -190,7 +236,24 @@ async def update_strategy(
     db: DBSession,
 ) -> Strategy:
     strategy = await _get_owned(db, strategy_id, current)
-    data = payload.model_dump(exclude_unset=True)
+    if strategy.status == "archived":
+        raise HTTPException(status_code=409, detail="已归档策略不可编辑")
+
+    # 乐观锁：base_updated_at 不写入 DB，仅做并发校验
+    base = payload.base_updated_at
+    data = payload.model_dump(exclude_unset=True, exclude={"base_updated_at"})
+    await _check_optimistic(strategy, base)
+
+    # P1：如果本次显式传入 builder_config（且非 None 清除）→ 跑 DSL 校验
+    bc_in_data = "builder_config" in data
+    if bc_in_data and data["builder_config"] is not None:
+        _raise_bad_builder(validate_builder_config(data["builder_config"]))
+    # 同样：如果显式传入 direction，要和现有 builder_config 的规则方向不冲突
+    if "direction" in data and strategy.builder_config is not None:
+        _raise_bad_builder(
+            validate_builder_config({**strategy.builder_config, "direction": data["direction"]})
+        )
+
     for field, value in data.items():
         setattr(strategy, field, value)
     try:
@@ -225,12 +288,10 @@ async def save_source(
     strategy = await _get_owned(db, strategy_id, current)
     if strategy.status == "archived":
         raise HTTPException(status_code=409, detail="已归档策略不可编辑")
-    if payload.base_updated_at is not None:
-        if strategy.updated_at is not None and payload.base_updated_at != strategy.updated_at:
-            raise HTTPException(
-                status_code=409, detail="策略已在其他窗口被修改，请刷新后重试"
-            )
+    await _check_optimistic(strategy, payload.base_updated_at)
+
     strategy.source_code = payload.source_code
+    strategy.source_code_hash = _source_hash(payload.source_code)
     await db.commit()
     await db.refresh(strategy)
     return StrategySourceOut(
@@ -238,6 +299,53 @@ async def save_source(
         updated_at=strategy.updated_at if strategy.updated_at is not None else datetime.now(),
         validation=validate_source(strategy.source_code),
     )
+
+
+# ---------------------------------------------------------------------------
+# Atomic builder save (replaces the split saveSource + update flow)
+# ---------------------------------------------------------------------------
+
+@router.put("/{strategy_id}/builder-save", response_model=StrategyDetailOut)
+async def builder_save(
+    strategy_id: uuid.UUID,
+    payload: StrategyBuilderSave,
+    current: CurrentUser,
+    db: DBSession,
+) -> Strategy:
+    """Single-transaction save: source_code + builder_config + metadata.
+
+    替换前端 BuilderPage 原来两次独立调用（saveSource 再 update）的非原子保存流。
+    后端会计算 source_code 的 SHA-256 存入 source_code_hash，供下次进入构建器时
+    判断源码是否被手动修改过（脱离检测）。
+    """
+    strategy = await _get_owned(db, strategy_id, current)
+    if strategy.status == "archived":
+        raise HTTPException(status_code=409, detail="已归档策略不可编辑")
+    await _check_optimistic(strategy, payload.base_updated_at)
+
+    # P1：服务端 DSL 校验
+    _raise_bad_builder(validate_builder_config(payload.builder_config))
+    # P1：服务端 AST 校验（error 级直接拒绝）
+    _raise_bad_source_if_error(payload.source_code)
+
+    # 同时更新源码 + builder_config + 元数据 + hash —— 单次事务原子写入
+    strategy.source_code = payload.source_code
+    strategy.source_code_hash = _source_hash(payload.source_code)
+    strategy.builder_config = payload.builder_config
+    if payload.direction is not None:
+        strategy.direction = payload.direction
+    if payload.symbol_ids is not None:
+        strategy.symbol_ids = payload.symbol_ids
+    if payload.timeframe is not None:
+        strategy.timeframe = payload.timeframe
+
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="同名策略已存在") from None
+    await db.refresh(strategy)
+    return strategy
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +441,9 @@ async def rollback_version(
     if strategy.current_version == version:
         raise HTTPException(status_code=409, detail="已是当前生效版本")
 
+    # 回滚前做 AST 校验（安全网：旧版本源码不能是 error 级问题）
+    _raise_bad_source_if_error(target.source_code)
+
     latest = await _latest_version(db, strategy.id)
     frozen = StrategyVersion(
         strategy_id=strategy.id,
@@ -344,6 +455,7 @@ async def rollback_version(
     db.add(frozen)
     strategy.current_version = frozen.version
     strategy.source_code = target.source_code
+    strategy.source_code_hash = _source_hash(target.source_code)
     try:
         await db.commit()
     except IntegrityError:

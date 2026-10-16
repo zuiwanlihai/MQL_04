@@ -189,7 +189,7 @@ describe('codegen 动作与方向联动', () => {
     cfg.rules = [crossRule('r1', 'ind_a', 'ind_b', 'sell', null)];
     const { errors } = generateStrategyCode(cfg);
     expect(errors.length).toBe(1);
-    expect(errors[0]).toContain('仅做多');
+    expect(errors[0].message).toContain('仅做多');
   });
 
   it('规则动作先平后开（反手语义）', () => {
@@ -239,33 +239,191 @@ describe('codegen 校验', () => {
     const cfg = dmaConfig();
     cfg.indicators = [];
     const { errors } = generateStrategyCode(cfg);
+    const msgs = errors.map((e) => e.message);
     // 两条规则 × 左右操作数 = 4 条悬空引用
     expect(errors.length).toBe(4);
-    expect(errors[0]).toContain('已删除的指标');
+    expect(msgs[0]).toContain('已删除的指标');
+    // P2：每条错误都带 targetId 指向规则
+    expect(errors[0].targetId).toBeTruthy();
   });
 
   it('非法参数报错（period<2 / MACD slow<=fast）', () => {
     const bad = emptyConfig();
     bad.indicators = [ma('a', 1)];
-    expect(generateStrategyCode(bad).errors.join()).toContain('≥ 2');
+    expect(generateStrategyCode(bad).errors.map((e) => e.message).join()).toContain('≥ 2');
 
     const badMacd = emptyConfig();
     badMacd.indicators = [{ id: 'm', kind: 'MACD', period: 0, fast: 26, slow: 12, signal: 9 }];
-    expect(generateStrategyCode(badMacd).errors.join()).toContain('慢线需大于快线');
+    expect(generateStrategyCode(badMacd).errors.map((e) => e.message).join()).toContain('慢线需大于快线');
   });
 
   it('手数非法与空品种报错', () => {
     const cfg = dmaConfig();
     cfg.volume = 0;
-    expect(generateStrategyCode(cfg).errors.join()).toContain('手数');
+    expect(generateStrategyCode(cfg).errors.map((e) => e.message).join()).toContain('手数');
     const cfg2 = dmaConfig();
     cfg2.symbol = ' ';
-    expect(generateStrategyCode(cfg2).errors.join()).toContain('品种');
+    expect(generateStrategyCode(cfg2).errors.map((e) => e.message).join()).toContain('品种');
   });
 
   it('规则无动作报错', () => {
     const cfg = dmaConfig();
     cfg.rules = [crossRule('r1', 'ind_a', 'ind_b', null, null)];
-    expect(generateStrategyCode(cfg).errors.join()).toContain('至少配置一个动作');
+    expect(generateStrategyCode(cfg).errors.map((e) => e.message).join()).toContain('至少配置一个动作');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// P3：风控积木 + 仓位模式
+// ─────────────────────────────────────────────────────────────────────
+
+describe('P3 风控积木代码生成', () => {
+  it('无 risk_blocks → 不生成风控检查代码', () => {
+    const { code } = generateStrategyCode(dmaConfig());
+    expect(code).not.toContain('P3 风控检查');
+  });
+
+  it('SL + TP 各生成一段检查', () => {
+    const cfg = dmaConfig();
+    cfg.risk_blocks = [
+      { id: 'sl1', kind: 'stop_loss', pips: 50 },
+      { id: 'tp1', kind: 'take_profit', pips: 100 },
+    ];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('P3 风控检查');
+    expect(code).toContain('SL hit long');
+    expect(code).toContain('SL hit short');
+    expect(code).toContain('TP hit long');
+    expect(code).toContain('TP hit short');
+    // pips 数值出现在代码中
+    expect(code).toContain('50 * ctx.get_symbol_info(ctx.symbol).point');
+    expect(code).toContain('100 * ctx.get_symbol_info(ctx.symbol).point');
+    // 生成代码通过 AST 校验
+    expect(generateStrategyCode(cfg).errors.filter((e) => !e.targetId).length).toBe(0);
+  });
+});
+
+describe('P3 仓位模式代码生成', () => {
+  it('无 sizing → 用 p["volume"]', () => {
+    const { code } = generateStrategyCode(dmaConfig());
+    expect(code).toContain('float(p["volume"])');
+  });
+
+  it('fixed sizing → 硬编码体积', () => {
+    const cfg = dmaConfig();
+    cfg.sizing = { kind: 'fixed', volume: 0.25 };
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('float(0.25)');
+    expect(code).not.toContain('p["volume"]');
+  });
+
+  it('risk_percent sizing → 动态体积计算', () => {
+    const cfg = dmaConfig();
+    cfg.sizing = { kind: 'risk_percent', risk_percent: 1.5, sl_pips: 50 };
+    cfg.risk_blocks = [{ id: 'sl1', kind: 'stop_loss', pips: 50 }];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('ctx.get_account().equity');
+    expect(code).toContain('ctx.get_symbol_info(ctx.symbol).point');
+    expect(code).toContain('ctx.get_symbol_info(ctx.symbol).contract_size');
+    expect(code).toContain('try:');
+    expect(code).toContain('_vol');
+    // 不包含固定 p["volume"]
+    expect(code).not.toContain('p["volume"]');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// P3 第二批：移动止损 + 最长持仓 + 账户级标记
+// ─────────────────────────────────────────────────────────────────────
+
+describe('P3第二批 更多风控代码生成', () => {
+  it('trailing_stop 用 ctx.storage 跟踪极值', () => {
+    const cfg = dmaConfig();
+    cfg.risk_blocks = [{ id: 't1', kind: 'trailing_stop', pips: 30 }];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('Trailing Stop');
+    expect(code).toContain('ctx.storage');
+    expect(code).toContain('max(_ext, pos.current_price)');
+    expect(code).toContain('min(_ext, pos.current_price)');
+    expect(code).toContain('del ctx.storage[_tkey]');
+    // storage key 前缀和持仓 id 拼接
+    expect(code).toContain('f"trail_t1_{pos.id}"');
+  });
+
+  it('max_holding_time 对比 pos.opened_at 与 ctx.now', () => {
+    const cfg = dmaConfig();
+    cfg.risk_blocks = [{ id: 'm1', kind: 'max_holding_time', minutes: 1440 }];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('Max Holding');
+    expect(code).toContain('pos.opened_at');
+    expect(code).toContain('ctx.now');
+    expect(code).toContain('_elapsed_min');
+    expect(code).toContain('1440');
+  });
+
+  it('账户级风控单独配置时生成注释说明待接入', () => {
+    const cfg = dmaConfig();
+    cfg.risk_blocks = [
+      { id: 'd1', kind: 'daily_drawdown_cut', percent: 10 },
+    ];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('daily_drawdown_cut');
+    expect(code).toContain('账户级风控，待接入');
+  });
+
+  it('多风控积木叠加：SL + TP + Trailing + MaxHold 全生成', () => {
+    const cfg = dmaConfig();
+    cfg.risk_blocks = [
+      { id: 's1', kind: 'stop_loss', pips: 50 },
+      { id: 't1', kind: 'take_profit', pips: 100 },
+      { id: 'tr1', kind: 'trailing_stop', pips: 30 },
+      { id: 'mh1', kind: 'max_holding_time', minutes: 60 },
+    ];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('SL hit');
+    expect(code).toContain('TP hit');
+    expect(code).toContain('TRAIL hit');
+    expect(code).toContain('MAX_HOLD hit');
+    // trailing storage 清理逻辑
+    expect(code).toContain('_live_ids = {p.id for p in positions}');
+    expect(code).toContain('del ctx.storage[_k]');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// P3-MPC: 最大持仓数（entry gate，不是 exit gate）
+// ─────────────────────────────────────────────────────────────────────
+
+describe('P3 最大持仓数（entry gate）', () => {
+  it('缺省 = 一次一仓（if len(positions) < 1）', () => {
+    const { code } = generateStrategyCode(dmaConfig());
+    expect(code).toContain('len(positions) < 1');
+  });
+
+  it('max_position_count=3 → 允许同时开 3 个', () => {
+    const cfg = dmaConfig();
+    cfg.risk_blocks = [{ id: 'mp1', kind: 'max_position_count', count: 3 }];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('len(positions) < 3');
+    // entry gate，emitRiskChecks 里不应生成持仓检查代码
+    expect(code).not.toContain('MAX_POS');
+  });
+
+  it('max_position_count=1 显式 → 等价缺省', () => {
+    const cfg = dmaConfig();
+    cfg.risk_blocks = [{ id: 'mp1', kind: 'max_position_count', count: 1 }];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('len(positions) < 1');
+  });
+
+  it('与其他风控叠加 → entry gate + exit gate 同时存在', () => {
+    const cfg = dmaConfig();
+    cfg.risk_blocks = [
+      { id: 'mp1', kind: 'max_position_count', count: 2 },
+      { id: 'sl1', kind: 'stop_loss', pips: 50 },
+    ];
+    const { code } = generateStrategyCode(cfg);
+    expect(code).toContain('len(positions) < 2');
+    expect(code).toContain('SL hit');
   });
 });

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { ArrowLeft, Info } from 'lucide-react';
 import { Link, useParams } from 'react-router-dom';
 import { DrawdownChart, EquityChart } from '@/components/backtest/Charts';
@@ -7,6 +7,7 @@ import MonthlyHeatmap from '@/components/backtest/MonthlyHeatmap';
 import OverfitPanel from '@/components/backtest/OverfitPanel';
 import OptimizationPanel from '@/components/backtest/OptimizationPanel';
 import SensitivityPanel from '@/components/backtest/SensitivityPanel';
+import { StrategyScorePanel } from '@/components/backtest/StrategyScore';
 import TradeTable from '@/components/backtest/TradeTable';
 import { MODE_LABELS, useBacktestReport, useBacktestTask } from '@/hooks/useBacktests';
 import { apiError } from '@/lib/api';
@@ -96,6 +97,24 @@ export default function BacktestReportPage() {
   const task = taskQ.data;
   const reportQ = useBacktestReport(taskId, task?.status);
   const report = reportQ.data?.report;
+
+  // ── Tabs ──
+  type TabKey = 'overview' | 'score' | 'trades' | 'overfit' | 'optimization' | 'sensitivity' | 'logs';
+  const allTabs: { key: TabKey; label: string; show: boolean }[] = [
+    { key: 'overview',      label: '📊 概览',       show: task?.status === 'completed' && !!report },
+    { key: 'score',         label: '🎯 评分',       show: task?.status === 'completed' && !!report },
+    { key: 'trades',        label: '📋 成交明细',   show: task?.status === 'completed' && !!report },
+    { key: 'overfit',       label: '🧪 过拟合检测', show: task?.status === 'completed' },
+    { key: 'optimization',  label: '⚙️ 参数优化',   show: task?.status === 'completed' },
+    { key: 'sensitivity',   label: '🔍 灵敏度分析', show: !!task?.group_id },
+    { key: 'logs',          label: '📝 运行日志',   show: true },
+  ];
+  const visibleTabs = allTabs.filter((t) => t.show);
+  const [activeTab, setActiveTab] = useState<TabKey>('overview');
+  const activeSafe = useMemo(() => {
+    if (visibleTabs.some((t) => t.key === activeTab)) return activeTab;
+    return visibleTabs[0]?.key ?? 'logs';
+  }, [activeTab, visibleTabs]);
 
   if (taskQ.isError) {
     return (
@@ -244,71 +263,6 @@ export default function BacktestReportPage() {
             <Metric label="恢复因子" value={num(report.recovery_factor)} />
             <Metric label="隔夜费" value={num(report.total_swap)} tone={tone(report.total_swap)} />
           </div>
-
-          <div className="card">
-            <div className="card-header">
-              <h3 className="text-sm font-medium text-gray-200">资金曲线</h3>
-              <span className="text-xs text-gray-500">蓝=净值 · 紫=余额 · 灰虚线=无操作基准</span>
-            </div>
-            <div className="card-body">
-              <EquityChart points={report.equity_curve} />
-            </div>
-          </div>
-
-          <div className="card">
-            <div className="card-header">
-              <h3 className="text-sm font-medium text-gray-200">回撤曲线</h3>
-            </div>
-            <div className="card-body">
-              <DrawdownChart points={report.equity_curve} />
-            </div>
-          </div>
-
-          <div className="grid md:grid-cols-2 gap-4">
-            <div className="card">
-              <div className="card-header">
-                <h3 className="text-sm font-medium text-gray-200">月度收益（%）</h3>
-              </div>
-              <div className="card-body">
-                <MonthlyHeatmap monthly={report.monthly_returns} />
-              </div>
-            </div>
-            <div className="card">
-              <div className="card-header">
-                <h3 className="text-sm font-medium text-gray-200">交易统计</h3>
-              </div>
-              <div className="card-body text-sm space-y-1.5">
-                <div className="flex justify-between">
-                  <span className="text-gray-500">盈利 / 亏损笔数</span>
-                  <span className="font-mono text-gray-200">
-                    {report.winning_trades} / {report.losing_trades}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-500">平均盈利 / 亏损</span>
-                  <span className="font-mono text-profit">{num(report.avg_win)}</span>
-                  <span className="text-gray-600">/</span>
-                  <span className="font-mono text-loss">{num(report.avg_loss)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-500">平均持仓时长</span>
-                  <span className="font-mono text-gray-200">{num(report.avg_hold_hours, 1)} 小时</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-500">最长连胜 / 连亏</span>
-                  <span className="font-mono text-gray-200">
-                    {report.consecutive_wins} / {report.consecutive_losses}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-500">最大回撤金额</span>
-                  <span className="font-mono text-loss">{num(report.max_drawdown_amount)}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <TradeTable taskId={task.id} enabled />
         </>
       )}
 
@@ -316,13 +270,127 @@ export default function BacktestReportPage() {
         <p className="text-sm text-gray-500">报告数据加载中…</p>
       )}
 
-      {task.group_id && <SensitivityPanel groupId={task.group_id} selfTaskId={task.id} />}
+      {/* ── 可切换标签：概览 / 成交明细 / 过拟合 / 参数优化 / 灵敏度 / 运行日志 ── */}
+      <div className="card">
+        <div className="card-body p-2">
+          <div className="flex items-center gap-1 bg-surface-900 rounded-lg p-1 border border-gray-700/50 overflow-x-auto">
+            {visibleTabs.map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => setActiveTab(tab.key)}
+                className={`px-3 py-1.5 text-sm rounded-md transition-colors whitespace-nowrap ${
+                  activeSafe === tab.key
+                    ? 'bg-surface-700 text-white'
+                    : 'text-gray-400 hover:text-gray-200 hover:bg-surface-800'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
 
-      {task.status === 'completed' && <OverfitPanel taskId={task.id} />}
+          <div className="mt-4">
+            {activeSafe === 'overview' && task.status === 'completed' && report && (
+              <div className="space-y-4">
+                <div className="card">
+                  <div className="card-header">
+                    <h3 className="text-sm font-medium text-gray-200">资金曲线</h3>
+                    <span className="text-xs text-gray-500">蓝=净值 · 紫=余额 · 灰虚线=无操作基准</span>
+                  </div>
+                  <div className="card-body">
+                    <EquityChart points={report.equity_curve} />
+                  </div>
+                </div>
+                <div className="card">
+                  <div className="card-header">
+                    <h3 className="text-sm font-medium text-gray-200">回撤曲线</h3>
+                  </div>
+                  <div className="card-body">
+                    <DrawdownChart points={report.equity_curve} />
+                  </div>
+                </div>
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div className="card">
+                    <div className="card-header">
+                      <h3 className="text-sm font-medium text-gray-200">月度收益（%）</h3>
+                    </div>
+                    <div className="card-body">
+                      <MonthlyHeatmap monthly={report.monthly_returns} />
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="card-header">
+                      <h3 className="text-sm font-medium text-gray-200">交易统计</h3>
+                    </div>
+                    <div className="card-body text-sm space-y-1.5">
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">盈利 / 亏损笔数</span>
+                        <span className="font-mono text-gray-200">
+                          {report.winning_trades} / {report.losing_trades}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">平均盈利 / 亏损</span>
+                        <span className="font-mono text-profit">{num(report.avg_win)}</span>
+                        <span className="text-gray-600">/</span>
+                        <span className="font-mono text-loss">{num(report.avg_loss)}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">平均持仓时长</span>
+                        <span className="font-mono text-gray-200">{num(report.avg_hold_hours, 1)} 小时</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">最长连胜 / 连亏</span>
+                        <span className="font-mono text-gray-200">
+                          {report.consecutive_wins} / {report.consecutive_losses}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-gray-500">最大回撤金额</span>
+                        <span className="font-mono text-loss">{num(report.max_drawdown_amount)}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
 
-      {task.status === 'completed' && <OptimizationPanel taskId={task.id} />}
+            {activeSafe === 'score' && task.status === 'completed' && report && (
+              report.score ? (
+                <StrategyScorePanel score={report.score} report={report} />
+              ) : (
+                <div className="card border-amber-400/40 bg-amber-400/10">
+                  <div className="card-body text-sm">
+                    <p className="font-medium text-amber-300">评分数据缺失</p>
+                    <p className="text-gray-300 mt-1">这份回测报告生成时评分逻辑尚未上线，需要重新运行一次回测才能看到评分。</p>
+                  </div>
+                </div>
+              )
+            )}
 
-      <LogPanel taskId={task.id} poll={active} />
+            {activeSafe === 'trades' && task.status === 'completed' && report && (
+              <TradeTable taskId={task.id} enabled />
+            )}
+
+            {activeSafe === 'overfit' && task.status === 'completed' && (
+              <OverfitPanel taskId={task.id} />
+            )}
+
+            {activeSafe === 'optimization' && task.status === 'completed' && (
+              <OptimizationPanel taskId={task.id} />
+            )}
+
+            {activeSafe === 'sensitivity' && task.group_id && (
+              <SensitivityPanel groupId={task.group_id} selfTaskId={task.id} />
+            )}
+
+            {activeSafe === 'logs' && (
+              <LogPanel taskId={task.id} poll={active} />
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

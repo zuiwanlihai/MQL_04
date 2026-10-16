@@ -474,6 +474,8 @@ async def active_gateways(
 
     python 节点：live probe of ``GET /health``（网关重启回退 .env 默认账户，
     下一次探活如实反映）；EA 桥节点：无 HTTP 服务，用绑定行合成快照。
+    附带该节点 MT5 终端本体「算法交易」按钮实况（``terminal.trade_allowed``）
+    ——顶栏徽标据此显示终端真实状态，与平台开关漂移时可被发现。
     Never persisted.
     """
     rows = (await db.execute(
@@ -488,20 +490,30 @@ async def active_gateways(
         if node.id in seen:  # 多账户同节点：python 节点以首次探活为准
             continue
         seen.add(node.id)
+        # 终端按钮实况：EA 桥 / 节点不可达 / 网关未上报 → None（前端回退平台开关）
+        terminal_allowed: bool | None = None
         if node.type == "ea_bridge":
             summary: AccountProbeResult | None = _probe_from_row(bound)
         else:
             client = GatewayClient.for_registered_node(node_base_url(node.host, node.port))
             summary = None
             try:
-                raw = (await client.health()).get("account")
+                health = await client.health()
+                raw = health.get("account")
                 if raw:
                     summary = _map_probe(raw)
+                t = (health.get("terminal") or {}).get("trade_allowed")
+                terminal_allowed = bool(t) if t is not None else None
             except GatewayError:
                 summary = None  # 节点不可达 → 前端显示离线
             finally:
                 await client.aclose()
         items.append(
-            ActiveAccountInfo(node_id=node.id, node_name=node.name, account=summary)
+            ActiveAccountInfo(
+                node_id=node.id,
+                node_name=node.name,
+                account=summary,
+                terminal_trade_allowed=terminal_allowed,
+            )
         )
     return ActiveAccountListResponse(items=items)

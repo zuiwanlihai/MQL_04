@@ -5,7 +5,6 @@
  * - 现价线（实时 bid，蓝色）
  * - 下一步买入线（现价下方最近的未持仓买位，绿色加粗）
  * - 下一步卖出线（现价上方最近的未持仓卖位，红色加粗）
- * - 下一步平仓线（多空两侧的止盈触发价中距现价最近者，橙色加粗）
  * - 网格线（双向：锚定 − k·step 买位 / 锚定 + k·step 卖位；
  *   已持仓=绿色实线，未开仓=灰色虚线）
  *
@@ -20,11 +19,9 @@ interface LadderLine {
     | 'current'
     | 'next-open'
     | 'next-open-sell'
-    | 'next-close'
     | 'entry'
     | 'grid-occupied'
-    | 'grid-free'
-    | 'close';
+    | 'grid-free';
   label: string;
   level?: number;
 }
@@ -33,21 +30,17 @@ const KIND_STYLES: Record<LadderLine['kind'], { line: string; chip: string }> = 
   current: { line: 'border-t-2 border-blue-400', chip: 'bg-blue-500/20 text-blue-300 border-blue-400/50' },
   'next-open': { line: 'border-t-2 border-profit', chip: 'bg-profit/20 text-profit border-profit/60 font-medium' },
   'next-open-sell': { line: 'border-t-2 border-loss', chip: 'bg-loss/20 text-loss border-loss/60 font-medium' },
-  'next-close': { line: 'border-t-2 border-loss', chip: 'bg-loss/20 text-loss border-loss/60 font-medium' },
   entry: { line: 'border-t border-dashed text-profit/70 border-current', chip: 'bg-surface-700 text-gray-300 border-gray-600' },
-  'grid-occupied': { line: 'border-t border-profit/60', chip: 'bg-profit/10 text-profit/90 border-profit/30' },
+  'grid-occupied': { line: 'border-t border-profit', chip: 'bg-profit text-white border-profit' },
   'grid-free': { line: 'border-t border-dashed border-gray-600', chip: 'bg-surface-800/80 text-gray-500 border-gray-700' },
-  close: { line: 'border-t border-dashed border-loss/50', chip: 'bg-loss/10 text-loss/80 border-loss/30' },
 };
 
 const Z_BY_KIND: Record<LadderLine['kind'], number> = {
   'grid-free': 10,
   'grid-occupied': 11,
-  close: 12,
   entry: 13,
   'next-open': 20,
   'next-open-sell': 20,
-  'next-close': 21,
   current: 30,
 };
 
@@ -97,20 +90,6 @@ export function PriceLadderChart({
   const isOccupied = (g: { price: number; side: 'buy' | 'sell' }) =>
     (g.side === 'buy' ? openPrices : sellOpenPrices).some((p) => Math.abs(p - g.price) < tol);
 
-  // 平仓触发线 = 多仓入场价 + 一格 / 空仓入场价 − 一格；与网格线重合时
-  // 不重复画（该网格线本身即平仓位），两侧触发价重合时也只画一条
-  const closeTargets = stepPrice > 0
-    ? [...openPrices.map((p) => p + stepPrice), ...sellOpenPrices.map((p) => p - stepPrice)]
-    : [];
-  const seenClose = new Set<number>();
-  const extraCloses = closeTargets.filter((c) => {
-    if (gridLevels.some((g) => Math.abs(g.price - c) < tol)) return false;
-    const key = Math.round(c / (tol || 1));
-    if (seenClose.has(key)) return false;
-    seenClose.add(key);
-    return true;
-  });
-
   // 下一步买入 = 现价以下最高的未持仓买位（全在上方时取最接近锚定价者）
   let nextOpen: number | null = null;
   if (hasGrid && openPrices.length < maxLevels) {
@@ -133,19 +112,11 @@ export function PriceLadderChart({
       nextOpenSell = (above.length ? above : freeSell)[0];
     }
   }
-  // 下一步平仓 = 距现价最近的平仓触发线（多空两侧取先触发者）
-  const nextClose = closeTargets.length
-    ? closeTargets.reduce((best, c) =>
-        currentPrice != null && Math.abs(c - currentPrice) < Math.abs(best - currentPrice) ? c : best,
-      )
-    : null;
-
   const all = [
     currentPrice,
     ...openPrices,
     ...sellOpenPrices,
     ...gridLevels.map((g) => g.price),
-    ...extraCloses,
     ...hist.map((h) => h.price),
   ].filter((v): v is number => v != null && Number.isFinite(v));
 
@@ -183,9 +154,6 @@ export function PriceLadderChart({
       label: '下一步卖出',
     });
   }
-  if (nextClose != null) {
-    lines.push({ price: nextClose, top: yOf(nextClose), kind: 'next-close', label: '下一步平仓' });
-  }
   for (const g of gridLevels) {
     const occ = isOccupied(g);
     lines.push({
@@ -195,9 +163,6 @@ export function PriceLadderChart({
       label: occ ? `已持仓 L${g.level}` : g.side === 'buy' ? `买 L${g.level}` : `卖 L${g.level}`,
       level: g.level,
     });
-  }
-  for (const c of extraCloses) {
-    lines.push({ price: c, top: yOf(c), kind: 'close', label: '平仓触发' });
   }
   // 非网格策略：入场价参考线（网格模式下已由「已持仓 Lx」表达，不重复画）
   if (!hasGrid) {
@@ -229,11 +194,6 @@ export function PriceLadderChart({
         {nextOpenSell != null && (
           <span className="flex items-center gap-1">
             <span className="inline-block w-3 border-t-2 border-loss" /> 下一步卖出
-          </span>
-        )}
-        {nextClose != null && (
-          <span className="flex items-center gap-1">
-            <span className="inline-block w-3 border-t-2 border-loss" /> 下一步平仓
           </span>
         )}
         {hasGrid && (

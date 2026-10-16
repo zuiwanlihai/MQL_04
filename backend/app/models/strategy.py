@@ -86,6 +86,12 @@ class Strategy(BaseModel, kw_only=True):
         comment="Working copy edited in the web editor. Excluded from list "
         "responses; only returned by the detail endpoint.",
     )
+    source_code_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None,
+        comment="SHA-256 hex of the current source_code; used by the visual "
+        "builder to detect if the user manually edited the code since last "
+        "builder-save. Null = old strategy migrated before this column existed.",
+    )
     builder_config: Mapped[dict | None] = mapped_column(
         JSONB, nullable=True, default=None,
         comment="Visual builder block DSL (P2); None = not builder-created "

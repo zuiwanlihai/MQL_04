@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Loader2, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useStrategies, useVersions } from '@/hooks/useStrategies';
@@ -8,7 +8,7 @@ import { useWatchlist } from '@/lib/watchlist';
 import { PAPER_MODE_ASSUMPTION_TEXT, PAPER_MODE_LABELS, useCreatePaperRun } from '@/hooks/usePaper';
 import { useSlippageCalibration } from '@/hooks/useBacktests';
 import StrategyParamsPanel from '@/components/strategies/StrategyParamsPanel';
-import { apiError } from '@/lib/api';
+import { api, apiError } from '@/lib/api';
 import { resolveSchema, seedValues } from '@/lib/strategyParams';
 import type { PaperExecutionMode, SpreadMode } from '@/types/api';
 
@@ -20,15 +20,28 @@ interface Props {
   open: boolean;
   onClose: () => void;
   presetStrategyId?: string;
+  /** 从「可视化虚拟数据」带数据集进来：直接切到合成数据集来源并预选 */
+  presetDatasetId?: number;
 }
 
-export default function PaperCreateDialog({ open, onClose, presetStrategyId }: Props) {
+interface SynthDatasetItem {
+  id: number;
+  name: string;
+  symbol: string;
+  bar_count: number;
+}
+
+export default function PaperCreateDialog({ open, onClose, presetStrategyId, presetDatasetId }: Props) {
   const navigate = useNavigate();
   const strategies = useStrategies({ page: 1, pageSize: 100 });
   const accounts = useAccounts();
   const activeQ = useActiveAccount();
   const create = useCreatePaperRun();
 
+  const [dataSource, setDataSource] = useState<'gateway' | 'synthetic'>('gateway');
+  const [datasetId, setDatasetId] = useState('');
+  const [datasets, setDatasets] = useState<SynthDatasetItem[]>([]);
+  const [dsLoading, setDsLoading] = useState(false);
   const [strategyId, setStrategyId] = useState('');
   const [version, setVersion] = useState<number | null>(null);
   const [symbol, setSymbol] = useState('EURUSD');
@@ -75,8 +88,32 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
     slippageTouched.current = false;
     depositTouched.current = false;
     if (presetStrategyId) setStrategyId(presetStrategyId);
-     
-  }, [open, presetStrategyId]);
+    if (presetDatasetId != null) {
+      setDataSource('synthetic');
+      setDatasetId(String(presetDatasetId));
+    } else {
+      setDataSource('gateway');
+      setDatasetId('');
+    }
+  }, [open, presetStrategyId, presetDatasetId]);
+
+  // 合成数据集来源：拉取可选数据集列表
+  useEffect(() => {
+    if (!open || dataSource !== 'synthetic') return;
+    let cancelled = false;
+    setDsLoading(true);
+    api
+      .get<SynthDatasetItem[]>('/synthetic-datasets?limit=100')
+      .then((r) => { if (!cancelled) setDatasets(r.data); })
+      .catch(() => { if (!cancelled) setDatasets([]); })
+      .finally(() => { if (!cancelled) setDsLoading(false); });
+    return () => { cancelled = true; };
+  }, [open, dataSource]);
+
+  const selectedDataset = useMemo(
+    () => datasets.find((d) => String(d.id) === datasetId) ?? null,
+    [datasets, datasetId],
+  );
 
   const selectedStrategy = useMemo(
     () => strategies.data?.items.find((s) => s.id === strategyId),
@@ -120,7 +157,9 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
   const assumptionText = PAPER_MODE_ASSUMPTION_TEXT[mode];
 
   const submit = () => {
-    if (!strategyId || !activeAccount || !ack) return;
+    if (!strategyId || !ack) return;
+    if (dataSource === 'gateway' && !activeAccount) return;
+    if (dataSource === 'synthetic' && !datasetId) return;
     let parameters: Record<string, unknown>;
     if (schema) {
       parameters = params;
@@ -145,7 +184,10 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
     create.mutate(
       {
         strategy_id: strategyId,
-        account_id: activeAccount.id,
+        data_source: dataSource,
+        ...(dataSource === 'gateway'
+          ? { account_id: activeAccount!.id }
+          : { synthetic_dataset_id: Number(datasetId) }),
         version,
         symbol: symbol.trim().toUpperCase(),
         timeframe,
@@ -179,6 +221,81 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
           </button>
         </div>
         <div className="card-body space-y-4">
+          {/* ── Step 1: 行情来源（必须最先选，后续字段联动） ─────────────── */}
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block">
+              <span className="text-xs text-gray-400">行情来源 *</span>
+              <select
+                className="input-dark mt-1"
+                value={dataSource}
+                onChange={(e) => setDataSource(e.target.value as 'gateway' | 'synthetic')}
+              >
+                <option value="gateway">网关实时行情（需登录 MT5 账户）</option>
+                <option value="synthetic">合成数据集回放（纯虚拟，无需账户）</option>
+              </select>
+              <p className="text-xs text-gray-500 mt-1">
+                {dataSource === 'gateway'
+                  ? '按已收盘 K 线增量撮合，随行情持续推进。'
+                  : '回放选定的合成 K 线数据集，回放完即停止推进。'}
+              </p>
+            </label>
+            {dataSource === 'synthetic' && (
+              <label className="block">
+                <span className="text-xs text-gray-400">合成数据集 *</span>
+                <select
+                  className="input-dark mt-1"
+                  value={datasetId}
+                  disabled={dsLoading}
+                  onChange={(e) => setDatasetId(e.target.value)}
+                >
+                  <option value="">{dsLoading ? '加载中…' : datasets.length === 0 ? '（暂无数据集，请先生成）' : '请选择数据集…'}</option>
+                  {datasets.map((d) => (
+                    <option key={d.id} value={String(d.id)}>
+                      #{d.id} {d.name}（{d.symbol} · {d.bar_count.toLocaleString()} 根 M1）
+                    </option>
+                  ))}
+                </select>
+                {selectedDataset && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    品种锁定：<span className="font-mono text-gray-300">{selectedDataset.symbol}</span>
+                  </p>
+                )}
+              </label>
+            )}
+          </div>
+
+          {dataSource === 'gateway' && (
+          <div className="space-y-1">
+            <span className="text-xs text-gray-400">当前登录 MT5 账户</span>
+            {activeQ.isLoading || accounts.isLoading ? (
+              <p className="text-sm text-gray-500 flex items-center gap-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> 正在获取当前登录账户…
+              </p>
+            ) : activeAccount ? (
+              <p className="text-sm text-gray-200 font-mono">
+                {activeAccount.login}@{activeAccount.server}
+                <span
+                  className={`ml-2 text-xs px-1.5 py-0.5 rounded font-sans ${
+                    activeAccount.account_type === 'real'
+                      ? 'bg-loss/15 text-loss'
+                      : 'bg-profit/15 text-profit'
+                  }`}
+                >
+                  {activeAccount.account_type === 'real' ? '实盘' : '模拟'}
+                </span>
+              </p>
+            ) : (
+              <p className="text-sm text-yellow-400">
+                未检测到已登录的 MT5 账户 — 请退出登录，在登录页使用 MT5 账号登录后再创建。
+              </p>
+            )}
+            <p className="text-xs text-gray-500">
+              虚拟下单自动使用当前登录账户所在的网关节点（服务器）取行情并登录。
+            </p>
+          </div>
+          )}
+
+          {/* ── Step 2: 策略 + 版本 ────────────────────────────────────────── */}
           <div className="grid grid-cols-2 gap-3">
             <label className="block">
               <span className="text-xs text-gray-400">策略 *</span>
@@ -220,53 +337,36 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
             </label>
           </div>
 
-          <div className="space-y-1">
-            <span className="text-xs text-gray-400">当前登录 MT5 账户</span>
-            {activeQ.isLoading || accounts.isLoading ? (
-              <p className="text-sm text-gray-500 flex items-center gap-2">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" /> 正在获取当前登录账户…
-              </p>
-            ) : activeAccount ? (
-              <p className="text-sm text-gray-200 font-mono">
-                {activeAccount.login}@{activeAccount.server}
-                <span
-                  className={`ml-2 text-xs px-1.5 py-0.5 rounded font-sans ${
-                    activeAccount.account_type === 'real'
-                      ? 'bg-loss/15 text-loss'
-                      : 'bg-profit/15 text-profit'
-                  }`}
-                >
-                  {activeAccount.account_type === 'real' ? '实盘' : '模拟'}
-                </span>
-              </p>
-            ) : (
-              <p className="text-sm text-yellow-400">
-                未检测到已登录的 MT5 账户 — 请退出登录，在登录页使用 MT5 账号登录后再创建。
-              </p>
-            )}
-            <p className="text-xs text-gray-500">
-              虚拟下单自动使用当前登录账户所在的网关节点（服务器）取行情并登录。
-            </p>
-          </div>
-
+          {/* ── Step 3: 品种 / 周期 / 资金 ──────────────────────────────────── */}
           <div className="grid grid-cols-4 gap-3">
-            <label className="block">
-              <span className="text-xs text-gray-400">品种 *</span>
-              <select
-                className="input-dark mt-1 font-mono"
-                value={symbol}
-                onChange={(e) => setSymbol(e.target.value)}
-              >
-                {!symbolOptions.some((s) => s.name === symbol) && (
-                  <option value={symbol}>{symbol}</option>
-                )}
-                {symbolOptions.map((s) => (
-                  <option key={s.name} value={s.name}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {dataSource === 'gateway' ? (
+              <label className="block">
+                <span className="text-xs text-gray-400">品种 *</span>
+                <select
+                  className="input-dark mt-1 font-mono"
+                  value={symbol}
+                  onChange={(e) => setSymbol(e.target.value)}
+                >
+                  {!symbolOptions.some((s) => s.name === symbol) && (
+                    <option value={symbol}>{symbol}</option>
+                  )}
+                  {symbolOptions.map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <label className="block">
+                <span className="text-xs text-gray-400">品种（数据集自带，锁定）</span>
+                <input
+                  className="input-dark mt-1 font-mono"
+                  value={selectedDataset?.symbol ?? '—'}
+                  disabled
+                />
+              </label>
+            )}
             <label className="block">
               <span className="text-xs text-gray-400">周期</span>
               <select className="input-dark mt-1" value={timeframe} onChange={(e) => setTimeframe(e.target.value)}>
@@ -296,6 +396,7 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
             </label>
           </div>
 
+          {/* ── Step 4: 预热 / 佣金 / 滑点 ─────────────────────────────── */}
           <div className="grid grid-cols-3 gap-3">
             <label className="block">
               <span className="text-xs text-gray-400">预热 K 线数（0-1000）</span>
@@ -331,7 +432,7 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
             </label>
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 gap-3">
             <label className="block">
               <span className="text-xs text-gray-400">点差模式</span>
               <select
@@ -353,6 +454,8 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
               />
             </label>
           </div>
+
+          {/* ── Step 5: 策略参数 ────────────────────────────────────────── */}
 
           <div>
             <span className="text-xs text-gray-400">
@@ -427,7 +530,10 @@ export default function PaperCreateDialog({ open, onClose, presetStrategyId }: P
             <button
               type="button"
               className="btn-primary"
-              disabled={!strategyId || !activeAccount || !ack || create.isPending}
+              disabled={
+                !strategyId || !ack || create.isPending ||
+                (dataSource === 'gateway' ? !activeAccount : !datasetId)
+              }
               onClick={submit}
             >
               {create.isPending && <Loader2 className="w-4 h-4 animate-spin" />}

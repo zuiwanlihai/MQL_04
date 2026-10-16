@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { AlertTriangle, Ban, Loader2, RefreshCw, XCircle } from 'lucide-react';
+﻿import { useState } from 'react';
+import { AlertTriangle, Ban, Loader2, XCircle } from 'lucide-react';
 import { useLiveMeta } from '@/hooks/useLive';
 import {
   useManualCancel,
@@ -68,10 +68,11 @@ interface Props {
  * 手动交易面板（嵌入虚拟下单 / 实盘 / 行情页面共用）。
  * 每笔操作先过事前风控闸（单笔手数/持仓数/敞口/保证金/冻结）并写入审计链。
  */
-export default function ManualTradePanel({ accountId, defaultSymbol, title }: Props) {
+export default function ManualTradePanel({ accountId, defaultSymbol }: Props) {
   const liveMeta = useLiveMeta();
   const enabled = liveMeta.data?.manual_trade_enabled ?? false;
 
+  const [tab, setTab] = useState<'order' | 'positions' | 'orders' | 'deals'>('order');
   const [symbol, setSymbol] = useState(defaultSymbol ?? 'EURUSD');
   const [side, setSide] = useState<'buy' | 'sell'>('buy');
   const [volume, setVolume] = useState('0.01');
@@ -122,29 +123,6 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
 
   return (
     <div className="space-y-4">
-      <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <h3 className="text-sm font-medium text-gray-200 flex items-center gap-2">
-            {title ?? '手动交易'}
-          </h3>
-          <p className="text-xs text-gray-500 mt-1">
-            每笔操作先过事前风控闸（单笔手数/持仓数/敞口/保证金/冻结），并写入审计链。
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {accountId && (
-            <button
-              type="button"
-              className="btn-ghost p-2"
-              onClick={() => snap.refetch()}
-              title="刷新镜像"
-            >
-              <RefreshCw className={`w-4 h-4 ${snap.isFetching ? 'animate-spin' : ''}`} />
-            </button>
-          )}
-        </div>
-      </div>
-
       {!enabled && (
         <div className="px-4 py-3 rounded border border-yellow-500/40 bg-yellow-500/10 text-sm text-yellow-300 flex items-center gap-2">
           <AlertTriangle className="w-4 h-4" />
@@ -159,7 +137,34 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
         </div>
       )}
 
+      {/* tab bar */}
+      <div className="flex items-center gap-1 border-b border-gray-800">
+        {[
+          { k: 'order', label: '手动下单' },
+          { k: 'positions', label: '持仓记录', count: (snap.data?.positions ?? []).length },
+          { k: 'orders', label: '挂单记录', count: (snap.data?.orders ?? []).length },
+          { k: 'deals', label: '成交历史', count: (deals.data ?? []).length },
+        ].map((t) => (
+          <button
+            key={t.k}
+            type="button"
+            onClick={() => setTab(t.k as typeof tab)}
+            className={`px-3 py-2 text-sm border-b-2 -mb-px transition-colors ${
+              tab === t.k ? 'border-blue-500 text-blue-300' : 'border-transparent text-gray-500 hover:text-gray-300'
+            }`}
+          >
+            {t.label}
+            {typeof t.count === 'number' && t.count > 0 && (
+              <span className="ml-1.5 px-1.5 py-0.5 rounded bg-surface-700 text-gray-300 text-[10px] font-mono">
+                {t.count}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+
       {/* order ticket */}
+      {tab === 'order' && (
       <div className="card">
         <div className="card-header">
           <h3 className="text-sm font-medium text-gray-200">下单票（市价单）</h3>
@@ -225,8 +230,10 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
           </p>
         </div>
       </div>
+      )}
 
       {/* positions */}
+      {tab === 'positions' && (
       <div className="card">
         <div className="card-header flex items-center justify-between">
           <h3 className="text-sm font-medium text-gray-200">
@@ -241,7 +248,7 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
             </p>
           ) : (
             <table className="table-dark">
-              <thead>
+              <thead className="sticky top-0 z-20 bg-surface-800">
                 <tr>
                   <th>Ticket</th>
                   <th>品种</th>
@@ -251,7 +258,7 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
                   <th>现价</th>
                   <th className="text-right">浮动盈亏</th>
                   <th>来源</th>
-                  <th className="text-right">操作</th>
+                  <th className="sticky right-0 bg-surface-800 text-right z-30">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -280,14 +287,14 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
                         </span>
                       )}
                     </td>
-                    <td className="text-right whitespace-nowrap">
+                    <td className="sticky right-0 bg-surface-800 text-right z-10 whitespace-nowrap">
                       <button
                         type="button"
-                        className="btn-ghost text-xs text-loss hover:bg-loss/10"
+                        className="btn-ghost text-xs text-loss hover:bg-loss/10 px-2 py-1"
                         disabled={!enabled || busy}
                         onClick={() => submitClose(p.ticket, p.symbol, p.volume)}
                       >
-                        <Ban className="w-3.5 h-3.5 mr-1" />
+                        <Ban className="w-3.5 h-3.5 mr-1 inline" />
                         平仓
                       </button>
                     </td>
@@ -298,8 +305,10 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
           )}
         </div>
       </div>
+      )}
 
       {/* pending orders */}
+      {tab === 'orders' && (
       <div className="card">
         <div className="card-header">
           <h3 className="text-sm font-medium text-gray-200">
@@ -311,7 +320,7 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
             <p className="text-sm text-gray-500 text-center py-6">当前无挂单</p>
           ) : (
             <table className="table-dark">
-              <thead>
+              <thead className="sticky top-0 z-20 bg-surface-800">
                 <tr>
                   <th>Ticket</th>
                   <th>品种</th>
@@ -319,7 +328,7 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
                   <th>手数</th>
                   <th>委托价</th>
                   <th>设置时间</th>
-                  <th className="text-right">操作</th>
+                  <th className="sticky right-0 bg-surface-800 text-right z-30">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -331,10 +340,10 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
                     <td className="font-mono">{money(o.volume)}</td>
                     <td className="font-mono">{formatPrice(o.price_open, 5)}</td>
                     <td className="text-gray-400 whitespace-nowrap">{dt(o.time_setup)}</td>
-                    <td className="text-right">
+                    <td className="sticky right-0 bg-surface-800 text-right z-10 whitespace-nowrap">
                       <button
                         type="button"
-                        className="btn-ghost text-xs"
+                        className="btn-ghost text-xs px-2 py-1"
                         disabled={!enabled || busy}
                         onClick={() => submitCancel(o.ticket)}
                       >
@@ -348,8 +357,10 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
           )}
         </div>
       </div>
+      )}
 
       {/* deals */}
+      {tab === 'deals' && (
       <div className="card">
         <div className="card-header flex items-center justify-between gap-2">
           <h3 className="text-sm font-medium text-gray-200">成交回报</h3>
@@ -406,6 +417,7 @@ export default function ManualTradePanel({ accountId, defaultSymbol, title }: Pr
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

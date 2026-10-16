@@ -164,6 +164,7 @@ const GRID_PARAM_GROUPS: ParamGroup[] = [
     fields: [
       { key: 'grid_step', label: '网格间距（点）', type: 'int', default: 200, min: 1, max: 10000, step: 10, hint: '点=券商最小报价单位，跨品种通用：EURUSD 200点=0.0020，XAUUSD 200点=2.00' },
       { key: 'max_levels', label: '最大网格层数', type: 'int', default: 5, min: 1, max: 50, step: 1, hint: '同时持有的网格挂单上限' },
+      { key: 'anchor_reset_secs', label: '锚点重置间隔（秒）', type: 'int', default: 0, min: 0, max: 86400, step: 60, hint: '0=永不重置；3600=每1小时，1800=每30分钟。重置后锚点追价，新开网格从新锚点对齐，已持仓止盈不变' },
     ],
   },
   { id: 'lot', label: '手数', fields: [VOLUME_FIELD] },

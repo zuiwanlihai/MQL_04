@@ -29,7 +29,24 @@ class GatewayError(Exception):
 
 
 class GatewayUnavailable(GatewayError):  # noqa: N818 — name fixed by plan spec
-    """The gateway process could not be reached (connect/timeout errors)."""
+    """The gateway process could not be reached (connect refused / DNS / TLS fail).
+
+    This maps to ``httpx.ConnectError`` only — the TCP handshake itself failed,
+    so the request never left the client.  The broker-side state is guaranteed
+    to be unchanged by this call; the caller does NOT need reconciliation.
+    """
+
+
+class GatewayProtocolError(GatewayError):
+    """The TCP/HTTP connection was established but the protocol layer broke
+    during the request (connection reset by peer, write failed mid-payload,
+    etc.).  This maps to ``httpx.ProtocolError``.
+
+    Unlike :class:`GatewayUnavailable`, the HTTP request *may* have been fully
+    received and executed by the gateway before the transport broke — the
+    outcome is UNKNOWN.  For trade calls this is effectively the same as
+    :class:`GatewayTimeout`: reconcile, never retry.
+    """
 
 
 class GatewayTimeout(GatewayError):  # noqa: N818 — mirrors sibling names
@@ -104,7 +121,22 @@ class GatewayClient:
             raise GatewayTimeout(
                 f"网关响应超时：{exc.__class__.__name__}，请求结果未知"
             ) from exc
+        except httpx.ConnectError as exc:
+            # TCP handshake itself failed — connect refused / DNS fail / TLS fail.
+            # The request never left the client; outcome is KNOWN (no-op).
+            reason = str(exc) or exc.__class__.__name__
+            raise GatewayUnavailable(_UNAVAILABLE_HINT.format(reason=reason)) from exc
+        except httpx.ProtocolError as exc:
+            # Connection WAS established but broke mid-request — connection
+            # reset by peer, write failed mid-payload, etc.  The gateway
+            # *might* have processed the request before the transport died.
+            reason = str(exc) or exc.__class__.__name__
+            raise GatewayProtocolError(
+                f"网关协议中断：{reason}，请求结果未知"
+            ) from exc
         except httpx.HTTPError as exc:
+            # Fallback for any other HTTPError subclass we haven't named —
+            # treat conservatively as "couldn't reach".
             reason = str(exc) or exc.__class__.__name__
             raise GatewayUnavailable(_UNAVAILABLE_HINT.format(reason=reason)) from exc
 

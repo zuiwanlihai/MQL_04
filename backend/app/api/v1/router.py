@@ -27,6 +27,7 @@ from app.api.v1.endpoints.notebooks import router as notebooks_router
 from app.api.v1.endpoints.notify import router as notify_router
 from app.api.v1.endpoints.paper import router as paper_router
 from app.api.v1.endpoints.strategies import router as strategies_router
+from app.api.v1.endpoints.synthetic_datasets import router as synthetic_datasets_router
 from app.api.v1.endpoints.ticks import router as ticks_router
 from app.api.v1.endpoints.trade import router as trade_router
 
@@ -59,6 +60,7 @@ v1_router.include_router(accounts_router, prefix="/accounts", tags=["accounts"])
 v1_router.include_router(gateway_router, prefix="/gateway", tags=["gateway"])
 v1_router.include_router(ea_bridge_router, prefix="/ea", tags=["ea-bridge"])
 v1_router.include_router(strategies_router, prefix="/strategies", tags=["strategies"])
+v1_router.include_router(synthetic_datasets_router, prefix="/synthetic-datasets", tags=["synthetic-datasets"])
 v1_router.include_router(backtests_router, prefix="/backtests", tags=["backtests"])
 v1_router.include_router(paper_router, prefix="/paper", tags=["paper"])
 v1_router.include_router(live_router, prefix="/live", tags=["live"])

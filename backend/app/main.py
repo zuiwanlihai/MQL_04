@@ -11,12 +11,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager, suppress
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+# Windows: asyncio.create_subprocess_exec 只在 ProactorEventLoop 上可用。
+# uvicorn --reload 默认强塞 SelectorEventLoop，导致所有 spawn 子进程
+# 的任务（回测 runner、paper/live runner）抛 NotImplementedError。
+# 这里显式设 Proactor，无论启动方式都可用。
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except NotImplementedError:
+        pass
 
 from app.api.v1.endpoints.market_ws import router as market_ws_router
 from app.api.v1.router import v1_router

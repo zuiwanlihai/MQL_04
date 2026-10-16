@@ -174,7 +174,12 @@ class BacktestTask(BaseModel, kw_only=True):
     )
     data_source: Mapped[str] = mapped_column(
         String(16), nullable=False, default="server", server_default="server",
-        comment="Bar data source: 'server' (gateway history) or 'local' (client-cached bars).",
+        comment="Bar data source: 'server' (gateway history), 'local' (client-cached bars), 'synthetic' (saved synthetic dataset).",
+    )
+    synthetic_dataset_id: Mapped[int | None] = mapped_column(
+        ForeignKey("synthetic_datasets.id", ondelete="SET NULL"),
+        index=True, nullable=True, default=None,
+        comment="data_source=synthetic 时：SyntheticDataset 主键。",
     )
 
     def __repr__(self) -> str:

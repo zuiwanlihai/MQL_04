@@ -8,7 +8,7 @@ import {
 } from 'lightweight-charts';
 import type { EquityPoint } from '@/types/api';
 
-const TIME_FMT = new Intl.DateTimeFormat('zh-CN', {
+const TIME_FMT_FULL = new Intl.DateTimeFormat('zh-CN', {
   timeZone: 'Asia/Shanghai',
   year: 'numeric',
   month: '2-digit',
@@ -17,6 +17,30 @@ const TIME_FMT = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
   hour12: false,
 });
+
+const TIME_FMT_SHORT = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
+const TIME_FMT_CLOCK = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
+/** 根据跨度选择合适的 tick 格式。同一天 → HH:mm；跨天 → MM/DD HH:mm；跨年 → YYYY/MM/DD HH:mm */
+function pickTickFormatter(startEpoch: number, endEpoch: number) {
+  const spanDays = (endEpoch - startEpoch) / 86400;
+  if (spanDays < 1) return (time: number) => TIME_FMT_CLOCK.format(new Date(time * 1000));
+  if (spanDays < 400) return (time: number) => TIME_FMT_SHORT.format(new Date(time * 1000));
+  return (time: number) => TIME_FMT_FULL.format(new Date(time * 1000));
+}
 
 function baseOptions() {
   return {
@@ -34,12 +58,10 @@ function baseOptions() {
     timeScale: {
       borderColor: '#374151',
       timeVisible: true,
-      tickMarkFormatter: (time: number) => {
-        const d = new Date(time * 1000);
-        return TIME_FMT.format(d).replace(/^\d{4}\/\d{2}\/\d{2} /, '');
-      },
     },
-    localization: { timeFormatter: (time: number) => TIME_FMT.format(new Date(time * 1000)) },
+    localization: {
+      timeFormatter: (time: number) => TIME_FMT_FULL.format(new Date(time * 1000)),
+    },
     handleScroll: true,
     handleScale: true,
   };
@@ -84,11 +106,34 @@ export function EquityChart({ points, height = 320 }: { points: EquityPoint[]; h
 
   useEffect(() => {
     if (!chartRef.current) return;
-    const sorted = [...points].sort((a, b) => toEpoch(a.time) - toEpoch(b.time));
-    const data = sorted.map((p) => ({ time: toEpoch(p.time) as UTCTimestamp }));
-    equityRef.current?.setData(sorted.map((p, i) => ({ ...data[i], value: p.equity })));
-    balanceRef.current?.setData(sorted.map((p, i) => ({ ...data[i], value: p.balance })));
-    baselineRef.current?.setData(sorted.map((p, i) => ({ ...data[i], value: p.baseline })));
+    if (!points.length) {
+      chartRef.current.timeScale().fitContent();
+      return;
+    }
+    // lightweight-charts 要求 time 严格递增 —— 同一时间戳的多条记录
+    // 必须去重，否则 setData 直接断言失败导致整个页面白屏。
+    // 保留每个 time 的最后一个（后产生的权益值覆盖先前的）。
+    const seen = new Set<number>();
+    const deduped = [...points]
+      .sort((a, b) => toEpoch(a.time) - toEpoch(b.time))
+      .filter((p) => {
+        const t = toEpoch(p.time);
+        if (seen.has(t)) return false;
+        seen.add(t);
+        return true;
+      });
+    // 按数据跨度选择 tick 格式（跨天必须带 MM/DD，否则用户看到乱序）
+    const startEpoch = toEpoch(deduped[0].time);
+    const endEpoch = toEpoch(deduped[deduped.length - 1].time);
+    chartRef.current.applyOptions({
+      timeScale: {
+        tickMarkFormatter: pickTickFormatter(startEpoch, endEpoch),
+      },
+    });
+    const data = deduped.map((p) => ({ time: toEpoch(p.time) as UTCTimestamp }));
+    equityRef.current?.setData(deduped.map((p, i) => ({ ...data[i], value: p.equity })));
+    balanceRef.current?.setData(deduped.map((p, i) => ({ ...data[i], value: p.balance })));
+    baselineRef.current?.setData(deduped.map((p, i) => ({ ...data[i], value: p.baseline })));
     chartRef.current.timeScale().fitContent();
   }, [points]);
 
@@ -127,9 +172,26 @@ export function DrawdownChart({ points, height = 200 }: { points: EquityPoint[];
 
   useEffect(() => {
     if (!chartRef.current || !seriesRef.current) return;
-    const sorted = [...points].sort((a, b) => toEpoch(a.time) - toEpoch(b.time));
+    const seen = new Set<number>();
+    const deduped = [...points]
+      .sort((a, b) => toEpoch(a.time) - toEpoch(b.time))
+      .filter((p) => {
+        const t = toEpoch(p.time);
+        if (seen.has(t)) return false;
+        seen.add(t);
+        return true;
+      });
+    if (deduped.length >= 2) {
+      const startEpoch = toEpoch(deduped[0].time);
+      const endEpoch = toEpoch(deduped[deduped.length - 1].time);
+      chartRef.current.applyOptions({
+        timeScale: {
+          tickMarkFormatter: pickTickFormatter(startEpoch, endEpoch),
+        },
+      });
+    }
     seriesRef.current.setData(
-      sorted.map((p) => ({ time: toEpoch(p.time) as UTCTimestamp, value: -p.drawdown })),
+      deduped.map((p) => ({ time: toEpoch(p.time) as UTCTimestamp, value: -p.drawdown })),
     );
     chartRef.current.timeScale().fitContent();
   }, [points]);

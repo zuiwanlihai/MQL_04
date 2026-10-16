@@ -171,6 +171,7 @@ def _new_task(user_id: uuid.UUID, payload: BacktestCreate, source: str, snapshot
         warmup_bars=payload.warmup_bars,
         parameters=payload.parameters,
         data_source=payload.data_source,
+        synthetic_dataset_id=payload.synthetic_dataset_id,
         config_snapshot=snapshot,
         group_id=group_id,
         created_by=user_id,
@@ -242,6 +243,15 @@ async def create_backtest(
                 status_code=422,
                 detail="本地缓存K线不足（至少50根）：请先在本地K线管理下载数据，或改用服务器数据",
             )
+
+    # 合成数据集校验
+    if payload.data_source == "synthetic":
+        if not payload.synthetic_dataset_id:
+            raise HTTPException(422, "data_source=synthetic 时必须传 synthetic_dataset_id")
+        from app.models.synthetic_dataset import SyntheticDataset
+        ds = await db.get(SyntheticDataset, payload.synthetic_dataset_id)
+        if ds is None:
+            raise HTTPException(422, f"合成数据集 #{payload.synthetic_dataset_id} 不存在")
 
     # Pre-enqueue bar-count guard (no gateway round-trip).
     est = estimate_bars(
@@ -1085,6 +1095,34 @@ async def delete_backtest(
     await db.commit()
 
 
+from pydantic import BaseModel
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[uuid.UUID]
+
+
+@router.post("/bulk-delete", status_code=status.HTTP_204_NO_CONTENT)
+async def bulk_delete_backtests(
+    payload: BulkDeleteRequest, current: CurrentUser, db: DBSession
+) -> None:
+    """批量删除回测任务 — 仅终态 (completed/failed/cancelled) 可删; 运行中会被跳过。"""
+    if not payload.ids:
+        return
+    user_id = uuid.UUID(current["sub"]) if isinstance(current, dict) else current.sub
+    result = await db.execute(
+        select(BacktestTask).where(
+            BacktestTask.id.in_(payload.ids),
+            BacktestTask.user_id == user_id,
+            BacktestTask.status.in_(("completed", "failed", "cancelled")),
+        )
+    )
+    tasks = result.scalars().all()
+    for task in tasks:
+        await db.delete(task)
+    await db.commit()
+
+
 @router.post(
     "/{task_id}/rerun", response_model=BacktestTaskOut, status_code=status.HTTP_201_CREATED
 )
@@ -1121,6 +1159,7 @@ async def rerun_backtest(
         warmup_bars=src.warmup_bars,
         parameters=src.parameters,
         data_source=src.data_source,
+        synthetic_dataset_id=src.synthetic_dataset_id,
         config_snapshot=snap,
         group_id=src.group_id,
         created_by=_user_id(current),

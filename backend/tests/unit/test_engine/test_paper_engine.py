@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pytest
 
 from app.sandbox.import_hook import uninstall_all
 from app.sandbox.paper_engine import PaperEngine
+from app.sandbox.payload import BarArrays
 from tests.unit.bt_helpers import BUY_ONCE, T0, make_bars, make_payload
 
 
@@ -364,3 +366,148 @@ def test_feed_ticks_runtime_error_fails_engine(tmp_path):
     assert eng.eng._halted is True
     # 引擎已 halt → 后续 tick 批次空转
     assert list(eng.feed_ticks(TICKS[1:])) == []
+
+
+# ── Grid level re-entry regression ──────────────────────────────
+
+# 直接内联 _grid_occupied（与 grid_trading.py 保持同步），避免 sandbox import 干扰
+GRID_FULL_SRC = """
+def _grid_occupied(ctx, side, poss, anchor, step):
+    fired_key = "grid_" + side + "_fired"
+    map_key = "grid_" + side + "_map"
+    fired = list(ctx.storage.get(fired_key, []))
+    slot = dict(ctx.storage.get(map_key, {}))
+
+    live_ids = set(p.id for p in poss)
+    slot = {k: v for k, v in slot.items() if k in live_ids}
+
+    bound = set(slot.values())
+    pending = [lv for lv in fired if lv not in bound]
+
+    unbound = [p for p in poss if p.id not in slot]
+    if unbound and pending:
+        pos_sorted = sorted(unbound, key=lambda p: p.open_price)
+        lv_sorted = sorted(pending, reverse=(side == "buy"))
+        n = min(len(pos_sorted), len(lv_sorted))
+        for i in range(n):
+            slot[pos_sorted[i].id] = lv_sorted[i]
+            bound.add(lv_sorted[i])
+        pending = [lv for lv in fired if lv not in bound]
+
+    unbound = [p for p in poss if p.id not in slot]
+    for p in unbound:
+        lv = 1
+        while lv in bound:
+            lv += 1
+        slot[p.id] = lv
+        bound.add(lv)
+        if lv in pending:
+            pending.remove(lv)
+
+    is_sync = getattr(ctx, "mode", "backtest") != "live"
+    if is_sync:
+        if len(poss) == len(slot):
+            pending = []
+    else:
+        if len(poss) >= len(slot) + len(pending):
+            pending = []
+
+    ctx.storage[fired_key] = pending
+    ctx.storage[map_key] = slot
+
+    occupied = set(bound)
+    for lv in pending:
+        occupied.add(lv)
+    ctx.log.info(
+        f"GRID_OCC side={side} poss={len(poss)} fired={fired} slot={slot} "
+        f"bound={bound} pending={pending} → occupied={occupied}"
+    )
+    return occupied
+
+def on_init(ctx):
+    ctx.declare(
+        symbol="EURUSD", period="H1",
+        params={"grid_step": 200, "max_levels": 3, "volume": 0.1},
+    )
+    if ctx.storage.get("anchor") is None:
+        ctx.storage["anchor"] = 1.10000
+
+def on_bar(ctx, bar):
+    info = ctx.get_symbol_info(ctx.symbol)
+    point = info.point if info else 0.0
+    if point <= 0:
+        return
+    step = ctx.params["grid_step"] * point
+    max_levels = ctx.params["max_levels"]
+    volume = ctx.params["volume"]
+
+    anchor = ctx.storage.get("anchor")
+
+    positions = ctx.get_positions()
+    for pos in positions:
+        if pos.direction == "buy" and bar.close >= pos.open_price + step:
+            ctx.log.info(f"GRID_EXIT close={pos.id} open={pos.open_price:.5f}")
+            ctx.close(pos.id)
+
+    positions = ctx.get_positions()
+    buy_poss = [p for p in positions if p.direction == "buy"]
+
+    occupied = _grid_occupied(ctx, "buy", buy_poss, anchor, step)
+    ctx.log.info(f"BAR close={bar.close:.5f} buy_positions={len(buy_poss)}")
+
+    if len(buy_poss) < max_levels:
+        for level in range(1, max_levels + 1):
+            target = anchor - level * step
+            ctx.log.info(f"  L{level} target={target:.5f} close<={bar.close <= target} occ={level in occupied}")
+            if bar.close <= target and level not in occupied:
+                r = ctx.buy(ctx.symbol, volume, comment=f"grid-buy-{level}")
+                if r.success:
+                    fired = list(ctx.storage.get("grid_buy_fired", []))
+                    fired.append(level)
+                    ctx.storage["grid_buy_fired"] = fired
+                ctx.log.info(f"GRID_BUY level={level} target={target:.5f} success={r.success}")
+                break
+
+def on_order(ctx, order):
+    pass
+"""
+
+
+def test_grid_level_reentry_after_take_profit(tmp_path):
+    """同档位止盈平仓后应能在后续 bar 重新开仓 —— 档位不能被永久占用。"""
+    # EURUSD point=0.00001, grid_step=200 → stepPrice=0.002
+    # anchor=1.10000, L1=1.09800
+    # STANDARD tier: buy fill = bar.close + spread(20pts=0.00020) + slippage
+    # bar1 close=1.09750 → fill ≈ 1.09770, L1止盈 = 1.09770 + 0.002 = 1.09970
+    # bar2 close=1.10080 >= 1.09970 → L1 止盈平仓
+    # bar3 close=1.09700 → L1=1.09800, 1.09700 <= 1.09800 → 应重新开仓
+    n = 4
+    times = T0 + np.arange(n, dtype="int64") * 3600
+    closes = np.array([1.10050, 1.09750, 1.10080, 1.09700])
+    opens = closes - 0.00001
+    highs = np.maximum(opens, closes) + 0.00002
+    lows = np.minimum(opens, closes) - 0.00002
+    bars = BarArrays(
+        time=times, open=opens, high=highs, low=lows, close=closes,
+        tick_volume=np.full(n, 100, dtype="int64"),
+        spread=np.full(n, 20, dtype="int64"),
+    )
+
+    payload = make_payload(GRID_FULL_SRC, mode="standard", warmup=0)
+    eng = PaperEngine(payload, bars, storage_path=tmp_path / "s.json")
+    events = list(eng.start())
+
+    log_msgs = _log_messages(events)
+    for m in log_msgs:
+        print(m)
+
+    buy_logs = [m for m in log_msgs if m.startswith("GRID_BUY")]
+    assert len(buy_logs) >= 2, f"Expected 2 GRID_BUY, got {buy_logs}"
+    assert all("level=1" in m for m in buy_logs), f"All buys should be L1: {buy_logs}"
+
+    trades = _by_kind(events, "trade")
+    assert len(trades) >= 1, "L1 should be take-profit closed on bar2"
+
+    last_acc = _by_kind(events, "account")[-1].data
+    assert len(last_acc["positions"]) >= 1, \
+        f"L1 re-entry should open a position, got positions={last_acc['positions']}"

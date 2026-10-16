@@ -211,6 +211,20 @@ export function useDeleteBacktest() {
   });
 }
 
+/** 批量删除回测任务 — 仅终态 (completed/failed/cancelled) 会被真正删除。 */
+export function useBulkDeleteBacktests() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (ids: string[]): Promise<void> => {
+      if (ids.length === 0) return;
+      await api.post(`${API}/bulk-delete`, { ids });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['backtests'] });
+    },
+  });
+}
+
 // ── Portfolio backtest (multi-symbol, PRD Phase 3 P2) ──
 
 /** 组合回测列表 — 存在 running 时 3s 轮询（读取时聚合）。 */

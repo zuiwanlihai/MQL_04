@@ -1005,13 +1005,25 @@ async def unfreeze_account(
     account_id: uuid.UUID, payload: UnfreezeRequest,
     current: CurrentUser, db: DBSession, request: Request
 ) -> dict:
-    """Manual unfreeze after a reconcile mismatch (admin, double confirm, audited)."""
+    """Manual unfreeze after a reconcile mismatch (owner OR admin, double confirm, audited).
+
+    Any account owner can unfreeze their own frozen account — no admin round-trip
+    needed.  Admins can unfreeze any account (e.g. helping a team member recover).
+    Double-confirm (UNFREEZE) and full audit trail are preserved in both paths.
+    """
     if payload.confirm.strip().upper() != "UNFREEZE":
         raise HTTPException(status_code=422, detail="二次确认失败：请输入 UNFREEZE")
-    await _require_role(db, current, ("admin",))
     acct = await db.get(MT5Account, account_id)
     if acct is None:
         raise HTTPException(status_code=404, detail="MT5 账户不存在")
+
+    # Permission: admin OR the owning user.
+    user = await db.get(User, _user_id(current))
+    is_admin = bool(user is not None and (user.role == "admin" or user.is_superuser))
+    is_owner = bool(user is not None and str(acct.user_id) == str(user.id))
+    if not (is_admin or is_owner):
+        raise HTTPException(status_code=403, detail="仅账户所有者或管理员可执行解冻")
+
     if not acct.trade_frozen:
         raise HTTPException(status_code=409, detail="账户未处于冻结状态")
     acct.trade_frozen = False

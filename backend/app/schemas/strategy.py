@@ -72,6 +72,29 @@ class StrategyUpdate(BaseModel):
     parameters: dict | None = Field(
         default=None, description="策略级参数覆盖；显式传 null 清除",
     )
+    base_updated_at: datetime | None = Field(
+        default=None,
+        description="乐观锁：客户端持有的 updated_at；不匹配返回 409；null 跳过检查（不推荐）",
+    )
+
+
+class StrategyBuilderSave(BaseModel):
+    """原子保存：源码 + builder_config + 元数据在同一事务内一起写入。
+
+    替换前端 BuilderPage 原来两次独立调用（save_source + update）的非原子保存流。
+    后端会计算 source_code 的 SHA-256 并存储到 source_code_hash，供构建器下次
+    进入时判断源码是否被手动修改过。
+    """
+
+    source_code: str = Field(max_length=200_000)
+    builder_config: dict = Field(description="可视化构建器积木配置")
+    direction: StrategyDirection | None = None
+    symbol_ids: list[str] | None = Field(default=None, max_length=50)
+    timeframe: Timeframe | None = None
+    base_updated_at: datetime | None = Field(
+        default=None,
+        description="乐观锁：客户端持有的 updated_at；不匹配返回 409",
+    )
 
 
 class StrategySourceUpdate(BaseModel):
@@ -108,6 +131,10 @@ class StrategyDetailOut(StrategyOut):
 
     source_code: str
     builder_config: dict | None = None
+    source_code_hash: str | None = Field(
+        default=None,
+        description="SHA-256 hex of current source_code; null = migrated before column existed.",
+    )
 
 
 class StrategyListResponse(BaseModel):

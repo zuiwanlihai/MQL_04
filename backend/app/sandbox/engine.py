@@ -882,4 +882,6 @@ class BacktestEngine:
             "rejections_by_code": rejections_by_code,
             **stats,
         }
+        # 在所有指标齐了之后再打分（依赖 stats 里的 trades / win_rate / pf 等）
+        report["score"] = metrics.strategy_score(report)
         return report

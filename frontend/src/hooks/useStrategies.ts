@@ -2,6 +2,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tansta
 import { api } from '@/lib/api';
 import type {
   Strategy,
+  StrategyBuilderSave,
   StrategyCreate,
   StrategyDetail,
   StrategyListResponse,
@@ -110,6 +111,31 @@ export function useSaveSource() {
       return data;
     },
     onSuccess: (_, { id }) => qc.invalidateQueries({ queryKey: ['strategies', id] }),
+  });
+}
+
+/**
+ * 原子保存构建器：source_code + builder_config + 元数据单次事务内一起写入。
+ * 替换原 BuilderPage 两次独立调用（saveSource 再 update）的非原子保存流。
+ * 返回完整 StrategyDetail（含 source_code_hash）供前端更新缓存。
+ */
+export function useSaveBuilder() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      id,
+      payload,
+    }: {
+      id: string;
+      payload: StrategyBuilderSave;
+    }): Promise<StrategyDetail> => {
+      const { data } = await api.put<StrategyDetail>(`${API}/${id}/builder-save`, payload);
+      return data;
+    },
+    onSuccess: (_, { id }) => {
+      qc.invalidateQueries({ queryKey: ['strategies', id] });
+      qc.invalidateQueries({ queryKey: ['strategies'] });
+    },
   });
 }
 

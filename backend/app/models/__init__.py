@@ -31,6 +31,7 @@ from app.models.portfolio import PortfolioBacktest
 from app.models.risk import RiskEvent, RiskRule
 from app.models.risk_position import RiskPositionLog
 from app.models.strategy import Strategy, StrategyTemplate, StrategyVersion
+from app.models.synthetic_dataset import SyntheticDataset
 from app.models.tick import TickData, TickSyncJob
 from app.models.user import User
 from app.models.user_session import UserSession
@@ -71,6 +72,7 @@ __all__ = [
     "Strategy",
     "StrategyTemplate",
     "StrategyVersion",
+    "SyntheticDataset",
     "TickData",
     "TickSyncJob",
     "User",

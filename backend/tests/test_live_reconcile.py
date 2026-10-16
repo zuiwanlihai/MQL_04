@@ -211,6 +211,362 @@ def test_reconcile_match_converges_pending(client, token, stub):
     assert client.portal.call(_check) is False
 
 
+# ── race-condition fix: flush before read ──────────────────────
+
+
+class _StubHandle:
+    """Stand-in for LiveManager._RunHandle — only account_id matters here."""
+
+    def __init__(self, account_id: str):
+        self.account_id = account_id
+
+
+class _StubManager:
+    """Replacement for LiveManager that exposes both flush_positions_for_account
+    and force_refresh_account, reading the "latest" positions from the test's
+    stub gateway (simulating what a real poll would have written to DB).
+    """
+
+    def __init__(self, account_id: str, positions: list[dict]):
+        self._account_id = account_id
+        self._positions = positions
+        self._handles = {
+            "fake-run": _StubHandle(account_id),
+        }
+
+    async def flush_positions_for_account(self, account_id: str) -> int:
+        """Force-write the fresh positions into DB, simulating what the real
+        manager does when reconcile knocks on the door before poll's DB write
+        throttle expires."""
+        if account_id != self._account_id:
+            return 0
+
+        from sqlalchemy import select
+
+        from app.engine.session import AsyncSessionLocal
+        from app.models import LiveRun
+
+        async with AsyncSessionLocal() as db:
+            runs = (await db.execute(
+                select(LiveRun).where(LiveRun.account_id == uuid.UUID(account_id))
+            )).scalars().all()
+            for run in runs:
+                stub_tickets = {p["ticket"] for p in self._positions}
+                db_tickets = {p["ticket"] for p in (run.positions or [])}
+                if stub_tickets != db_tickets:
+                    run.positions = list(self._positions)
+                    db.add(run)
+            await db.commit()
+        return len(self._handles)
+
+    async def force_refresh_account(
+        self, account_id: str, *, client=None,
+    ) -> dict:
+        """Auto-converge helper used by reconcile Step 3.  Same logic as
+        flush — writes fresh stub positions to DB — returns the new dict
+        shape that matches the real manager's contract."""
+        n = await self.flush_positions_for_account(account_id)
+        return {"ok": n > 0, "handles": n, "gateway_down": False}
+
+
+def test_reconcile_race_flush_closes_gap(client, token, stub, monkeypatch):
+    """Poll refreshes gateway mirror but _write_account has a 2s throttle,
+    so run.positions in DB lags h.positions.  Reconcile landing in that gap
+    must NOT fire a false-positive freeze."""
+    from sqlalchemy import select
+
+    from app.services.live import manager as manager_mod
+    from app.services.live.reconcile import reconcile_once
+
+    # Scenario: gateway has 2 positions (202 + 303), but DB only has 202 —
+    # exactly what happens when poll refreshed h.positions but the throttle
+    # hasn't let _write_account push it to DB yet.
+    pos_polled = [
+        {"ticket": 202, "symbol": "EURUSD", "type": "buy", "volume": 0.1,
+         "price_open": 1.1, "price_current": 1.1, "profit": 0.0, "swap": 0.0,
+         "commission": 0.0, "time": 1, "magic": 777, "identifier": 202,
+         "comment": ""},
+        {"ticket": 303, "symbol": "EURUSD", "type": "sell", "volume": 0.1,
+         "price_open": 1.1, "price_current": 1.1, "profit": 0.0, "swap": 0.0,
+         "commission": 0.0, "time": 2, "magic": 777, "identifier": 303,
+         "comment": ""},
+    ]
+    pos_stale = [pos_polled[0]]  # only 202 in DB
+
+    seeded = _seed_run(client, token, positions=pos_stale, magic=777)
+
+    # Gateway returns the full polled set (what real poll would see).
+    stub.positions_rows = pos_polled
+
+    # Install stub manager so reconcile's flush step actually works.
+    mgr = _StubManager(seeded["account_id"], pos_polled)
+    monkeypatch.setattr(manager_mod, "get_live_manager", lambda: mgr)
+
+    # Sanity check: DB is stale before reconcile.
+    async def _verify_stale():
+        from app.engine.session import AsyncSessionLocal
+        from app.models import LiveRun
+        async with AsyncSessionLocal() as db:
+            run = await db.get(LiveRun, uuid.UUID(seeded["run_id"]))
+            return {p["ticket"] for p in (run.positions or [])}
+    assert client.portal.call(_verify_stale) == {202}
+
+    # Run reconcile — flush should close the gap.
+    out = client.portal.call(reconcile_once)
+    assert out[seeded["account_id"]] == 0  # ← key: no diff after flush
+
+    # DB now matches the gateway.
+    assert client.portal.call(_verify_stale) == {202, 303}
+
+    # Account NOT frozen — the race window is gone.
+    async def _check_frozen():
+        from app.engine.session import AsyncSessionLocal
+        from app.models import MT5Account
+        async with AsyncSessionLocal() as db:
+            acct = await db.get(MT5Account, uuid.UUID(seeded["account_id"]))
+            return acct.trade_frozen
+    assert client.portal.call(_check_frozen) is False
+
+
+# ── root-cause 2: timeout convergence ──────────────────────────
+
+
+def test_timeout_converge_closes_reconcile_gap(client, token, stub, monkeypatch):
+    """GatewayTimeout on an order that *did* fill on the broker side leaves
+    the terminal with an extra ticket the platform mirror doesn't have.
+    Without immediate convergence the 5-minute reconcile cycle would see a
+    diff and freeze the account.  After _force_converge_after_unknown runs
+    the mirror is current and reconcile converges cleanly."""
+    import uuid as uuid_mod
+    from sqlalchemy import select
+
+    from app.engine.session import AsyncSessionLocal
+    from app.models import LiveRun, MT5Account
+    from app.services.live import manager as manager_mod
+    from app.services.live.manager import get_live_manager
+    from app.services.live.reconcile import reconcile_once
+
+    # Patch manager module's GatewayClient so force_converge reads from the
+    # same stub instance the reconcile fixture uses — not the real MT5 gateway.
+    class _PatchedGC:
+        @staticmethod
+        def for_registered_node(*a, **k):
+            return stub
+    monkeypatch.setattr(manager_mod, "GatewayClient", _PatchedGC)
+
+    # DB mirror = old set (ticket 100 only — poll hasn't refreshed after timeout)
+    old_positions = [{
+        "ticket": 100, "symbol": "EURUSD", "type": "buy", "volume": 0.1,
+        "price_open": 1.1, "price_current": 1.1, "profit": 0.0, "swap": 0.0,
+        "commission": 0.0, "time": 1, "magic": 666, "identifier": 100,
+        "comment": "",
+    }]
+    # Gateway has old + the timeout-filled new position (ticket 200)
+    new_positions = old_positions + [{
+        "ticket": 200, "symbol": "EURUSD", "type": "buy", "volume": 0.2,
+        "price_open": 1.1, "price_current": 1.1, "profit": 0.0, "swap": 0.0,
+        "commission": 0.0, "time": 2, "magic": 666, "identifier": 200,
+        "comment": "",
+    }]
+
+    seeded = _seed_run(client, token, positions=old_positions, magic=666)
+    stub.positions_rows = new_positions
+
+    # —— Phase 1: WITHOUT convergence, reconcile fires diff=1 and freezes ——
+    out_pre = client.portal.call(reconcile_once)
+    assert out_pre[seeded["account_id"]] == 1  # ticket 200 diff
+
+    async def _check_frozen():
+        async with AsyncSessionLocal() as db:
+            acct = await db.get(MT5Account, uuid_mod.UUID(seeded["account_id"]))
+            return acct.trade_frozen
+    assert client.portal.call(_check_frozen) is True
+
+    # Reset: unfreeze so we can test the converged path on a clean slate.
+    async def _unfreeze():
+        async with AsyncSessionLocal() as db:
+            acct = await db.get(MT5Account, uuid_mod.UUID(seeded["account_id"]))
+            acct.trade_frozen = False
+            db.add(acct)
+            run = await db.get(LiveRun, uuid_mod.UUID(seeded["run_id"]))
+            run.positions = list(old_positions)
+            db.add(run)
+            await db.commit()
+    client.portal.call(_unfreeze)
+
+    # —— Phase 2: apply force_converge ——
+    class _FakeHandle:
+        def __init__(self, run_id: str, account_id: str):
+            self.run_id = run_id
+            self.account_id = account_id
+            self.gateway_url = None
+            self.account = {}
+            self.positions = []
+            self.day_start_equity = 0.0
+            self.peak_equity = 0.0
+            self.day_start_date = ""
+            self.halt_until = ""
+            self.last_account_write = 0.0
+
+    mgr = get_live_manager()
+    h = _FakeHandle(seeded["run_id"], seeded["account_id"])
+
+    async def _do_converge():
+        await mgr._force_converge_after_unknown(h)
+    client.portal.call(_do_converge)
+
+    # Verify DB now matches gateway.
+    async def _check_db_tickets():
+        async with AsyncSessionLocal() as db:
+            run = await db.get(LiveRun, uuid_mod.UUID(seeded["run_id"]))
+            return {p["ticket"] for p in (run.positions or [])}
+    assert client.portal.call(_check_db_tickets) == {100, 200}
+
+    # —— Phase 3: reconcile NOW sees zero diff ——
+    out_post = client.portal.call(reconcile_once)
+    assert out_post[seeded["account_id"]] == 0
+    assert client.portal.call(_check_frozen) is False
+
+
+# ── root-cause 3: manual MT5 operation → auto-converge ─────────
+
+
+def test_reconcile_auto_converges_after_manual_mt5_close(client, token, stub, monkeypatch):
+    """User manually closes an AI-managed position directly in the MT5
+    terminal.  The platform mirror hasn't caught up yet → reconcile sees a
+    diff.  Instead of freezing, it should refresh the mirror from the
+    gateway and re-check — after which diff disappears, poll lag was the
+    only cause."""
+    import uuid as uuid_mod
+
+    from app.services.live import manager as manager_mod
+    from app.services.live.reconcile import reconcile_once
+
+    # Simulate a stale mirror: DB still has both 100 and 200,
+    # but MT5 gateway (stub) shows only 100 — user manually closed 200 there.
+    both = [
+        {"ticket": 100, "symbol": "EURUSD", "type": "buy", "volume": 0.1,
+         "price_open": 1.1, "price_current": 1.1, "profit": 0.0, "swap": 0.0,
+         "commission": 0.0, "time": 1, "magic": 888, "identifier": 100,
+         "comment": ""},
+        {"ticket": 200, "symbol": "EURUSD", "type": "buy", "volume": 0.1,
+         "price_open": 1.1, "price_current": 1.1, "profit": 0.0, "swap": 0.0,
+         "commission": 0.0, "time": 2, "magic": 888, "identifier": 200,
+         "comment": ""},
+    ]
+    only_100 = [both[0]]  # what MT5 shows after user closed 200 manually
+
+    seeded = _seed_run(client, token, positions=both, magic=888)
+    stub.positions_rows = only_100  # MT5 no longer has ticket 200
+
+    # Need a StubManager with handles that force_refresh can find, and whose
+    # mirrors return only_100 (the "fresh" gateway value).
+    mgr = _StubManager(seeded["account_id"], only_100)
+    monkeypatch.setattr(manager_mod, "get_live_manager", lambda: mgr)
+
+    async def _check_frozen():
+        from app.engine.session import AsyncSessionLocal
+        from app.models import MT5Account
+        async with AsyncSessionLocal() as db:
+            acct = await db.get(MT5Account, uuid_mod.UUID(seeded["account_id"]))
+            return acct.trade_frozen
+
+    # —— Phase 1: WITHOUT auto-converge, reconcile would have frozen ——
+    # (we can't easily simulate the old behavior without undoing the code,
+    # but the below proves that WITH auto-converge it does NOT freeze.)
+
+    # —— Phase 2: reconcile runs with auto-converge ——
+    out = client.portal.call(reconcile_once)
+    assert out[seeded["account_id"]] == 0  # ✅ diff auto-converged
+    assert client.portal.call(_check_frozen) is False  # ✅ NOT frozen
+
+
+# ── root-cause 4: protocol break (connection reset) convergence ──
+
+
+def test_protocol_error_triggers_convergence(client, token, stub, monkeypatch):
+    """GatewayProtocolError (connection reset by peer mid-request) has the same
+    UNKNOWN outcome as GatewayTimeout — the request may have been fully
+    processed by the gateway before the transport broke.  It must trigger
+    flag_reconcile + _force_converge_after_unknown, NOT be treated as a
+    known no-op (connect-refused style)."""
+    import uuid as uuid_mod
+
+    from app.engine.session import AsyncSessionLocal
+    from app.models import LiveRun, MT5Account
+    from app.services.gateway_client import GatewayProtocolError
+    from app.services.live import manager as manager_mod
+    from app.services.live.manager import get_live_manager
+
+    class _PatchedGC:
+        @staticmethod
+        def for_registered_node(*a, **k):
+            return stub
+    monkeypatch.setattr(manager_mod, "GatewayClient", _PatchedGC)
+
+    # DB mirror lags broker reality (same shape as timeout test)
+    old_positions = [{
+        "ticket": 100, "symbol": "EURUSD", "type": "buy", "volume": 0.1,
+        "price_open": 1.1, "price_current": 1.1, "profit": 0.0, "swap": 0.0,
+        "commission": 0.0, "time": 1, "magic": 777, "identifier": 100,
+        "comment": "",
+    }]
+    new_positions = old_positions + [{
+        "ticket": 300, "symbol": "EURUSD", "type": "buy", "volume": 0.15,
+        "price_open": 1.1, "price_current": 1.1, "profit": 0.0, "swap": 0.0,
+        "commission": 0.0, "time": 3, "magic": 777, "identifier": 300,
+        "comment": "",
+    }]
+
+    seeded = _seed_run(client, token, positions=old_positions, magic=777)
+    stub.positions_rows = new_positions
+
+    async def _unfreeze():
+        async with AsyncSessionLocal() as db:
+            acct = await db.get(MT5Account, uuid_mod.UUID(seeded["account_id"]))
+            acct.trade_frozen = False
+            db.add(acct)
+            await db.commit()
+    client.portal.call(_unfreeze)
+
+    class _FakeHandle:
+        def __init__(self, run_id: str, account_id: str):
+            self.run_id = run_id
+            self.account_id = account_id
+            self.gateway_url = None
+            self.account = {}
+            self.positions = []
+            self.day_start_equity = 0.0
+            self.peak_equity = 0.0
+            self.day_start_date = ""
+            self.halt_until = ""
+            self.last_account_write = 0.0
+
+    mgr = get_live_manager()
+    h = _FakeHandle(seeded["run_id"], seeded["account_id"])
+
+    # GatewayProtocolError path shares _force_converge_after_unknown with
+    # GatewayTimeout — call the helper directly to verify it converges
+    # the mirror to gateway reality (stub).
+    async def _do_protocol_error_converge():
+        await mgr._force_converge_after_unknown(h)
+    client.portal.call(_do_protocol_error_converge)
+
+    async def _check_db_tickets():
+        async with AsyncSessionLocal() as db:
+            run = await db.get(LiveRun, uuid_mod.UUID(seeded["run_id"]))
+            return {p["ticket"] for p in (run.positions or [])}
+    assert client.portal.call(_check_db_tickets) == {100, 300}, (
+        "GatewayProtocolError path must converge mirror to gateway reality"
+    )
+
+    async def _check_frozen():
+        async with AsyncSessionLocal() as db:
+            acct = await db.get(MT5Account, uuid_mod.UUID(seeded["account_id"]))
+            return acct.trade_frozen
+    assert client.portal.call(_check_frozen) is False
+
+
 # ── demotion ───────────────────────────────────────────────────
 
 def test_close_all_and_stop_demotes(client, token, stub):
@@ -260,7 +616,9 @@ def test_alerts_list_and_read(client, token, stub):
     assert r.json()["is_read"] is True
 
 
-def test_unfreeze_requires_admin_confirm(client, token, stub):
+def test_unfreeze_requires_owner_or_admin(client, token, stub):
+    """Account owner can unfreeze their own account OR admin can unfreeze any.
+    Non-owner non-admin → 403.  UNFREEZE second-confirm + audit preserved."""
     seeded = _seed_run(client, token, positions=[], magic=555)
 
     async def _freeze():
@@ -274,17 +632,45 @@ def test_unfreeze_requires_admin_confirm(client, token, stub):
             await db.commit()
     client.portal.call(_freeze)
 
+    # Wrong confirm word → 422
     bad = client.post(f"{API}/accounts/{seeded['account_id']}/unfreeze",
-                      json={"review_note": "核对无误，差异为手动平仓",
+                      json={"review_note": "核对无误差异为手动平仓",
                             "confirm": "WRONG"}, headers=_auth(token))
     assert bad.status_code == 422
 
-    role = client.get("/api/v1/auth/me", headers=_auth(token)).json()["role"]
+    # Owner (token user owns the account) → 200
     ok = client.post(f"{API}/accounts/{seeded['account_id']}/unfreeze",
-                     json={"review_note": "核对无误，差异为手动平仓",
+                     json={"review_note": "核对无误差异为手动平仓",
                            "confirm": "UNFREEZE"}, headers=_auth(token))
-    # admin (first registered user) → 200; trader → 403
-    assert ok.status_code == (200 if role == "admin" else 403)
+    assert ok.status_code == 200, (
+        "account owner should be able to unfreeze their own frozen account"
+    )
+
+    # Non-owner non-admin → 403.  Register a second unrelated user.
+    r2 = client.post(
+        "/api/v1/auth/register",
+        json={"email": f"rc2-{uuid.uuid4().hex[:10]}@test.com",
+              "username": f"rc2{uuid.uuid4().hex[:10]}",
+              "password": "Passw0rd!", "full_name": "对账测试2"},
+    )
+    token2 = r2.json()["access_token"]
+
+    async def _refreeze():
+        from app.engine.session import AsyncSessionLocal
+        from app.models import MT5Account
+        async with AsyncSessionLocal() as db:
+            acct = await db.get(MT5Account, uuid.UUID(seeded["account_id"]))
+            acct.trade_frozen = True
+            db.add(acct)
+            await db.commit()
+    client.portal.call(_refreeze)
+
+    forbidden = client.post(f"{API}/accounts/{seeded['account_id']}/unfreeze",
+                            json={"review_note": "outsider attempting unfreeze",
+                                  "confirm": "UNFREEZE"}, headers=_auth(token2))
+    assert forbidden.status_code == 403, (
+        "non-owner non-admin must NOT be able to unfreeze someone else's account"
+    )
 
 
 def test_rules_crud_and_audit(client, token):

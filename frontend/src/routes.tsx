@@ -1,4 +1,5 @@
 import { lazy, type ReactNode } from 'react';
+import { Navigate } from 'react-router-dom';
 
 // Lazy load all page components
 const Login = lazy(() => import('@/pages/Login'));
@@ -16,7 +17,6 @@ const MarketListingDetailPage = lazy(() => import('@/pages/Marketplace/MarketLis
 const BacktestListPage = lazy(() => import('@/pages/Backtest/BacktestListPage'));
 const BacktestReportPage = lazy(() => import('@/pages/Backtest/BacktestReportPage'));
 const PortfolioReportPage = lazy(() => import('@/pages/Backtest/PortfolioReportPage'));
-const PaperListPage = lazy(() => import('@/pages/Paper/PaperListPage'));
 const PaperDetailPage = lazy(() => import('@/pages/Paper/PaperDetailPage'));
 const LiveListPage = lazy(() => import('@/pages/Live/LiveListPage'));
 const LiveDetailPage = lazy(() => import('@/pages/Live/LiveDetailPage'));
@@ -57,7 +57,8 @@ export const routeConfigs: RouteConfig[] = [
   { path: '/backtest/:taskId/report', element: <BacktestReportPage /> },
   { path: '/notebooks', element: <NotebookListPage /> },
   { path: '/notebooks/:id', element: <NotebookDetailPage /> },
-  { path: '/trading/paper', element: <PaperListPage /> },
+  // 虚拟下单已合并到「回测中心」tab，独立入口重定向过去（兼容旧链接）
+  { path: '/trading/paper', element: <Navigate to="/backtest" replace /> },
   { path: '/trading/paper/:runId', element: <PaperDetailPage /> },
   { path: '/trading/live-demo', element: <LiveListPage scope="demo" /> },
   { path: '/trading/live-demo/:runId', element: <LiveDetailPage /> },

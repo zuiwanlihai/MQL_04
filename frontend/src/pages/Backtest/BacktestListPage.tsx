@@ -1,14 +1,16 @@
 import { useState } from 'react';
-import { ChevronLeft, ChevronRight, GitCompare, Layers, Loader2, Plus, RotateCcw, Star, Trash2, X, XCircle } from 'lucide-react';
+import { BarChart2, ChevronLeft, ChevronRight, Download, GitCompare, Layers, Loader2, Plus, RotateCcw, Save, Star, Trash2, X, XCircle } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import BacktestCreateDialog from '@/components/backtest/BacktestCreateDialog';
 import CompareDialog from '@/components/backtest/CompareDialog';
 import PortfolioCreateDialog from '@/components/backtest/PortfolioCreateDialog';
-import { MODE_LABELS, useBacktests, useCancelBacktest, useDeleteBacktest, usePortfolios, useRateBacktest, useRerunBacktest } from '@/hooks/useBacktests';
+import CandlestickChart from '@/components/charts/CandlestickChart';
+import { MODE_LABELS, useBacktests, useBulkDeleteBacktests, useCancelBacktest, useDeleteBacktest, usePortfolios, useRateBacktest, useRerunBacktest } from '@/hooks/useBacktests';
 import LocalDataManager from '@/components/backtest/LocalDataManager';
 import { useQueueOverview } from '@/hooks/useNotebooks';
 import { useStrategies } from '@/hooks/useStrategies';
-import { apiError } from '@/lib/api';
+import { api, apiError } from '@/lib/api';
+import { generateCandles, SHAPE_LABELS, type Candle, type TrendShape } from '@/lib/syntheticData';
 import type { BacktestStatus, PortfolioStatus } from '@/types/api';
 
 const STATUS_OPTIONS: { value: '' | BacktestStatus; label: string }[] = [
@@ -54,7 +56,7 @@ const PF_STATUS_LABELS: Record<PortfolioStatus, string> = {
 };
 
 export default function BacktestListPage() {
-  const [tab, setTab] = useState<'tasks' | 'portfolios' | 'localdata'>('tasks');
+  const [tab, setTab] = useState<'tasks' | 'portfolios' | 'viz' | 'localdata'>('tasks');
   const [page, setPage] = useState(1);
   const [pfPage, setPfPage] = useState(1);
   const [status, setStatus] = useState<'' | BacktestStatus>('');
@@ -63,6 +65,102 @@ export default function BacktestListPage() {
   const [pfCreateOpen, setPfCreateOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [compareOpen, setCompareOpen] = useState(false);
+
+  // ─── viz state（虚拟数据生成面板） ───
+  const [vizStart, setVizStart] = useState(() => {
+    const d = new Date();
+    d.setMonth(d.getMonth() - 3);  // 默认 3 个月前
+    return d.toISOString().slice(0, 16);
+  });
+  const [vizEnd, setVizEnd] = useState(() => new Date().toISOString().slice(0, 16));
+  const [vizBasePrice, setVizBasePrice] = useState(1900);
+  const [vizVol, setVizVol] = useState(0.0005);
+  const [vizShape, setVizShape] = useState<TrendShape>('random');
+  const [vizTrendStrength, setVizTrendStrength] = useState(0.15);
+  const [vizData, setVizData] = useState<Candle[]>([]);
+  const [vizError, setVizError] = useState<string | null>(null);
+  const [vizLoading, setVizLoading] = useState(false);
+
+  const runGenerate = () => {
+    setVizError(null);
+    setVizLoading(true);
+    try {
+      const data = generateCandles(vizStart, vizEnd, 'M1', vizBasePrice, vizVol, vizShape, vizTrendStrength);
+      setVizData(data);
+    } catch (e) {
+      setVizError((e as Error).message);
+      setVizData([]);
+    } finally {
+      setVizLoading(false);
+    }
+  };
+
+  // ─── 保存合成数据集（前端直接发 bars 数组，后端存 Parquet/JSONB） ───
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [saveName, setSaveName] = useState('');
+  const [saveDesc, setSaveDesc] = useState('');
+  const [saveLoading, setSaveLoading] = useState(false);
+  const [saveResult, setSaveResult] = useState<string | null>(null);
+
+  const doSave = async () => {
+    if (!saveName.trim()) { setSaveResult('请输入名称'); return; }
+    if (vizData.length === 0) { setSaveResult('还没有数据可以保存'); return; }
+    setSaveLoading(true);
+    setSaveResult(null);
+    try {
+      const firstTime = vizData[0].time;
+      const lastTime = vizData[vizData.length - 1].time + 60;
+      const totalBars = vizData.length;
+
+      // ── 形状分两路，统一走 Parquet 存储 ──
+      //   简单形状（random / uptrend / downtrend）  → 只传参数，后端 numpy GBM 生成
+      //   复杂形状（V / 倒V / W / M）               → 传前端已生成的 bars，后端直接写 Parquet
+      const SIMPLE_SHAPES: TrendShape[] = ['random', 'uptrend', 'downtrend'];
+      const isSimple = SIMPLE_SHAPES.includes(vizShape);
+
+      let body: any;
+      if (isSimple) {
+        // 每根 bar 的 log drift（uptrend 正、downtrend 负、random 零）
+        const drift =
+          vizShape === 'uptrend'   ?  vizTrendStrength / totalBars
+          : vizShape === 'downtrend' ? -vizTrendStrength / totalBars
+          :                             0;
+        body = {
+          name: saveName.trim(),
+          description: saveDesc.trim() || null,
+          symbol: 'XAUUSD',
+          base_price: vizBasePrice,
+          volatility: vizVol,
+          drift,
+          first_time: firstTime,
+          last_time: lastTime,
+          seed: null,
+          // bars 字段不传 → 后端走 GBM 路径
+        };
+      } else {
+        // 复杂形状：前端本地已生成好 bars，传给后端直接写 Parquet
+        body = {
+          name: saveName.trim(),
+          description: saveDesc.trim() || null,
+          symbol: 'XAUUSD',
+          base_price: vizBasePrice,
+          volatility: vizVol,
+          bars: vizData.map((c) => ({
+            time: c.time, open: c.open, high: c.high,
+            low: c.low, close: c.close, volume: c.volume,
+          })),
+        };
+      }
+
+      await api.post('/synthetic-datasets/generate', body);
+      setSaveResult('保存成功 ✅');
+      setTimeout(() => { setSaveOpen(false); setSaveResult(null); }, 1500);
+    } catch (e) {
+      setSaveResult(apiError(e));
+    } finally {
+      setSaveLoading(false);
+    }
+  };
 
   const toggleSelect = (id: string) =>
     setSelected((prev) =>
@@ -80,6 +178,7 @@ export default function BacktestListPage() {
   const rerun = useRerunBacktest();
   const rate = useRateBacktest();
   const del = useDeleteBacktest();
+  const bulkDel = useBulkDeleteBacktests();
   const queue = useQueueOverview();
   const data = list.data;
   const pfData = portfolios.data;
@@ -87,11 +186,26 @@ export default function BacktestListPage() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-4 flex-wrap">
-        <div>
-          <h1 className="text-xl font-semibold text-white">回测中心</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            子进程沙箱回放 · 三档撮合假设 · 敏感性对比（SDK v1 / Python）
-          </p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <div>
+            <h1 className="text-xl font-semibold text-white">回测中心</h1>
+            <p className="text-sm text-gray-500 mt-1">
+              子进程沙箱回放 · 三档撮合假设 · 敏感性对比（SDK v1 / Python）
+            </p>
+          </div>
+          {queue.data && (
+            <div className="flex items-center gap-3 text-xs text-gray-400 border-l border-gray-700/60 pl-3 ml-1">
+              <span className="text-gray-500 font-medium">队列</span>
+              <span>
+                运行中{' '}
+                <span className="text-blue-300 font-semibold">{queue.data.running.length}</span>
+              </span>
+              <span>
+                排队{' '}
+                <span className="text-yellow-300 font-semibold">{queue.data.pending_count}</span>
+              </span>
+            </div>
+          )}
         </div>
         {tab !== 'localdata' && (tab === 'tasks' ? (
           <button type="button" className="btn-primary" onClick={() => setCreateOpen(true)}>
@@ -138,30 +252,21 @@ export default function BacktestListPage() {
         >
           本地数据管理
         </button>
+        <button
+          type="button"
+          onClick={() => setTab('viz')}
+          className={`px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
+            tab === 'viz'
+              ? 'border-blue-400 text-blue-300 font-medium'
+              : 'border-transparent text-gray-500 hover:text-gray-300'
+          }`}
+        >
+          虚拟数据生成
+        </button>
         {tab === 'portfolios' && pfData && (
           <span className="ml-auto text-xs text-gray-500">共 {pfData.total} 个组合</span>
         )}
       </div>
-
-      {/* 任务队列监控窄条（M18） */}
-      {queue.data && (
-        <div className="card px-4 py-2 flex items-center gap-4 text-xs text-gray-400">
-          <span className="text-gray-500 font-medium">队列</span>
-          <span>
-            运行中{' '}
-            <span className="text-blue-300 font-semibold">{queue.data.running.length}</span>
-          </span>
-          <span>
-            排队{' '}
-            <span className="text-yellow-300 font-semibold">{queue.data.pending_count}</span>
-          </span>
-          {queue.data.oldest_pending_created_at && (
-            <span className="text-gray-500">
-              最早已排队 {new Date(queue.data.oldest_pending_created_at).toLocaleTimeString('zh-CN', { hour12: false })}
-            </span>
-          )}
-        </div>
-      )}
 
       {tab === 'tasks' && (
       <>
@@ -202,6 +307,24 @@ export default function BacktestListPage() {
         )}
         {selected.length > 0 && (
           <div className="flex items-center gap-2 ml-auto">
+            <button
+              type="button"
+              className="px-3 py-1.5 flex items-center gap-1.5 disabled:opacity-50 rounded border border-loss/40 bg-loss/10 text-loss hover:bg-loss/20"
+              disabled={bulkDel.isPending}
+              onClick={() => {
+                if (window.confirm(`确认删除选中的 ${selected.length} 条回测记录？运行中的任务会自动跳过，报告、成交与日志将一并删除，不可恢复。`)) {
+                  bulkDel.mutate(selected, { onSuccess: () => setSelected([]) });
+                }
+              }}
+              title="批量删除选中记录（运行中任务将跳过，不可恢复）"
+            >
+              {bulkDel.isPending ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Trash2 className="w-4 h-4" />
+              )}
+              删除（{selected.length}）
+            </button>
             <button
               type="button"
               className="btn-primary px-3 py-1.5 flex items-center gap-1.5 disabled:opacity-50"
@@ -440,9 +563,9 @@ export default function BacktestListPage() {
               还没有回测任务，点击右上角「新建回测」开始。
             </div>
           )}
-          {(cancel.isError || rerun.isError || rate.isError || del.isError) && (
+          {(cancel.isError || rerun.isError || rate.isError || del.isError || bulkDel.isError) && (
             <div className="px-4 py-2 text-sm text-loss bg-loss/10 border-t border-loss/30">
-              操作失败：{apiError(cancel.error ?? rerun.error ?? rate.error ?? del.error)}
+              操作失败：{apiError(cancel.error ?? rerun.error ?? rate.error ?? del.error ?? bulkDel.error)}
             </div>
           )}
         </div>
@@ -472,6 +595,126 @@ export default function BacktestListPage() {
         </div>
       )}
       </>
+      )}
+
+      {tab === 'viz' && (
+        <div className="space-y-4">
+          <div className="card">
+            <div className="card-body space-y-4">
+              <p className="text-xs text-gray-500">
+                合成 M1 粒度随机漫步 OHLCV，支持日线级别宏观形状叠加，M1 最大 130 万根。
+              </p>
+              <div className="flex flex-wrap items-end gap-3">
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">起始时间</label>
+                  <input
+                    type="datetime-local"
+                    className="input-dark text-xs px-2 py-1.5 w-48"
+                    value={vizStart}
+                    onChange={(e) => setVizStart(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">结束时间</label>
+                  <input
+                    type="datetime-local"
+                    className="input-dark text-xs px-2 py-1.5 w-48"
+                    value={vizEnd}
+                    onChange={(e) => setVizEnd(e.target.value)}
+                  />
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="text-xs text-gray-500">粒度固定：</span>
+                  <span className="text-xs font-medium text-blue-300">1 分钟</span>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">起始价</label>
+                  <input
+                    type="number" step="1"
+                    className="input-dark text-xs px-2 py-1.5 w-28"
+                    value={vizBasePrice}
+                    onChange={(e) => setVizBasePrice(Number(e.target.value))}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">波动率</label>
+                  <input
+                    type="number" step="0.0001"
+                    className="input-dark text-xs px-2 py-1.5 w-28"
+                    value={vizVol}
+                    onChange={(e) => setVizVol(Number(e.target.value))}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">行情形状</label>
+                  <select
+                    className="input-dark text-xs px-2 py-1.5 w-32"
+                    value={vizShape}
+                    onChange={(e) => setVizShape(e.target.value as TrendShape)}
+                  >
+                    {Object.entries(SHAPE_LABELS).map(([k, v]) => (
+                      <option key={k} value={k}>{v}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">
+                    趋势强度 <span className="text-gray-600">({(vizTrendStrength * 100).toFixed(0)}%)</span>
+                  </label>
+                  <input
+                    type="range" min="0.01" max="0.50" step="0.01"
+                    className="w-28 accent-blue-500"
+                    value={vizTrendStrength}
+                    disabled={vizShape === 'random'}
+                    onChange={(e) => setVizTrendStrength(Number(e.target.value))}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="btn-primary text-sm px-4 py-1.5 disabled:opacity-50"
+                  onClick={runGenerate}
+                  disabled={vizLoading}
+                >
+                  {vizLoading ? (
+                    <><Loader2 className="w-4 h-4 animate-spin" /> 生成中…</>
+                  ) : (
+                    <><Download className="w-4 h-4" /> 生成并画图</>
+                  )}
+                </button>
+                {vizData.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      className="btn-ghost text-sm px-4 py-1.5"
+                      onClick={() => { setSaveOpen(true); setSaveName(''); setSaveDesc(''); setSaveResult(null); }}
+                    >
+                      <Save className="w-4 h-4" /> 保存为数据集
+                    </button>
+                    <span className="text-xs text-gray-500">
+                      {vizData.length} 根 · 首 {vizData[0].open.toFixed(2)} → 尾 {vizData[vizData.length - 1].close.toFixed(2)}
+                    </span>
+                  </>
+                )}
+              </div>
+              {vizError && (
+                <div className="text-xs text-loss bg-loss/10 border border-loss/30 rounded px-3 py-2">
+                  {vizError}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 图表区 */}
+          {vizData.length > 0 ? (
+            <CandlestickChart data={vizData} height={480} />
+          ) : (
+            <div className="card flex flex-col items-center justify-center py-24 text-center">
+              <BarChart2 className="w-12 h-12 text-gray-600 mb-4" />
+              <h3 className="text-base font-medium text-gray-300">还没有数据</h3>
+              <p className="text-sm text-gray-500 mt-1">设置时间范围和周期 → 点击「生成并画图」</p>
+            </div>
+          )}
+        </div>
       )}
 
       {tab === 'localdata' && <LocalDataManager />}
@@ -586,6 +829,57 @@ export default function BacktestListPage() {
 
       {compareOpen && selected.length >= 2 && (
         <CompareDialog taskIds={selected} onClose={() => setCompareOpen(false)} />
+      )}
+
+      {/* 保存为合成数据集 dialog */}
+      {saveOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => !saveLoading && setSaveOpen(false)}>
+          <div className="card w-[420px]" onClick={(e) => e.stopPropagation()}>
+            <div className="card-body space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-base font-medium text-white">保存为合成数据集</h3>
+                <button type="button" className="text-gray-500 hover:text-gray-300" disabled={saveLoading} onClick={() => setSaveOpen(false)}>
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">名称 *</label>
+                <input
+                  type="text" maxLength={128}
+                  className="input-dark w-full"
+                  placeholder="如：XAUUSD-2026H1-随机漫步"
+                  value={saveName}
+                  onChange={(e) => setSaveName(e.target.value)}
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">描述（可选）</label>
+                <textarea
+                  rows={2} maxLength={512}
+                  className="input-dark w-full resize-none"
+                  placeholder="随机漫步 OHLCV，M1 粒度"
+                  value={saveDesc}
+                  onChange={(e) => setSaveDesc(e.target.value)}
+                />
+              </div>
+              <p className="text-xs text-gray-500">
+                将保存 <span className="text-gray-300">{vizData.length}</span> 根 M1 K 线（{vizShape} · 起始价 {vizBasePrice} · 波动率 {vizVol}）
+              </p>
+              {saveResult && (
+                <div className={`text-xs rounded px-3 py-2 ${saveResult.includes('成功') ? 'text-profit bg-profit/10 border border-profit/30' : 'text-loss bg-loss/10 border border-loss/30'}`}>
+                  {saveResult}
+                </div>
+              )}
+              <div className="flex justify-end gap-2 pt-1">
+                <button type="button" className="btn-ghost" disabled={saveLoading} onClick={() => setSaveOpen(false)}>取消</button>
+                <button type="button" className="btn-primary" disabled={saveLoading} onClick={doSave}>
+                  {saveLoading ? <><Loader2 className="w-4 h-4 animate-spin" /> 保存中…</> : '保存'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

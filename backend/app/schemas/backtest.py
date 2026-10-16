@@ -46,9 +46,13 @@ class BacktestCreate(BaseModel):
     timeframe: Timeframe
     start_date: datetime = Field(description="回放窗口起点（UTC，含）")
     end_date: datetime = Field(description="回放窗口终点（UTC，不含）")
-    data_source: Literal["server", "local"] = Field(
+    data_source: Literal["server", "local", "synthetic"] = Field(
         default="server",
-        description="K 线来源：server=网关历史，local=浏览器本地缓存K线（local_bars 必传）",
+        description="K 线来源：server=网关历史，local=浏览器本地缓存，synthetic=合成数据集（需传 synthetic_dataset_id）",
+    )
+    synthetic_dataset_id: int | None = Field(
+        default=None,
+        description="data_source=synthetic 时：SyntheticDataset 主键",
     )
     local_bars: list[LocalBarIn] | None = Field(
         default=None,

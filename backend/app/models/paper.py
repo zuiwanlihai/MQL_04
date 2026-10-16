@@ -97,6 +97,15 @@ class PaperRun(BaseModel, kw_only=True):
     timeframe: Mapped[str] = mapped_column(
         String(8), nullable=False, comment="Bar period (M1..D1)."
     )
+    data_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="gateway",
+        comment="行情来源：gateway=网关实时 / synthetic=合成数据集回放。",
+    )
+    synthetic_dataset_id: Mapped[int | None] = mapped_column(
+        ForeignKey("synthetic_datasets.id", ondelete="SET NULL"),
+        index=True, nullable=True, default=None,
+        comment="data_source=synthetic 时：SyntheticDataset 主键（Integer）。",
+    )
     execution_mode: Mapped[str] = mapped_column(
         String(16), nullable=False,
         comment="standard | optimistic (conservative needs a next bar).",

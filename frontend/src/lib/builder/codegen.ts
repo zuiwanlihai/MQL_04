@@ -16,13 +16,20 @@ import type {
   IndicatorBlock,
   IndicatorOutput,
   Operand,
+  RiskBlock,
   Rule,
 } from './types';
 import { INDICATOR_META } from './types';
 
+export interface BuilderError {
+  /** 关联的 indicator.id / rule.id；undefined 表示全局错误 */
+  targetId?: string;
+  message: string;
+}
+
 export interface CodegenResult {
   code: string;
-  errors: string[];
+  errors: BuilderError[];
 }
 
 const INDENT1 = '    ';
@@ -35,25 +42,25 @@ interface MetricVarInfo {
   n: number;
 }
 
-/** 指标参数校验；返回错误列表。 */
-function validateIndicators(indicators: IndicatorBlock[]): string[] {
-  const errors: string[] = [];
+/** 指标参数校验；返回结构化错误列表（含 targetId = indicator.id）。 */
+function validateIndicators(indicators: IndicatorBlock[]): BuilderError[] {
+  const errors: BuilderError[] = [];
   const ids = new Set<string>();
   indicators.forEach((ind, i) => {
     const label = `指标 #${i + 1}`;
-    if (ids.has(ind.id)) errors.push(`${label}：内部 id 重复（${ind.id}）`);
+    if (ids.has(ind.id)) errors.push({ targetId: ind.id, message: `${label}：内部 id 重复（${ind.id}）` });
     ids.add(ind.id);
-    if (!INDICATOR_META[ind.kind]) errors.push(`${label}：未知指标类型 ${ind.kind}`);
+    if (!INDICATOR_META[ind.kind]) errors.push({ targetId: ind.id, message: `${label}：未知指标类型 ${ind.kind}` });
     if (ind.kind === 'MACD') {
       const { fast = 12, slow = 26, signal = 9 } = ind;
-      if (!Number.isFinite(fast) || fast < 2) errors.push(`${label}：MACD 快线周期需 ≥ 2`);
-      if (!Number.isFinite(slow) || slow <= (fast ?? 0)) errors.push(`${label}：MACD 慢线需大于快线`);
-      if (!Number.isFinite(signal) || signal < 2) errors.push(`${label}：MACD 信号周期需 ≥ 2`);
+      if (!Number.isFinite(fast) || fast < 2) errors.push({ targetId: ind.id, message: `${label}：MACD 快线周期需 ≥ 2` });
+      if (!Number.isFinite(slow) || slow <= (fast ?? 0)) errors.push({ targetId: ind.id, message: `${label}：MACD 慢线需大于快线` });
+      if (!Number.isFinite(signal) || signal < 2) errors.push({ targetId: ind.id, message: `${label}：MACD 信号周期需 ≥ 2` });
     } else if (!Number.isFinite(ind.period) || ind.period < 2) {
-      errors.push(`${label}：${ind.kind} 周期需 ≥ 2`);
+      errors.push({ targetId: ind.id, message: `${label}：${ind.kind} 周期需 ≥ 2` });
     }
     if (ind.kind === 'BOLL' && (!Number.isFinite(ind.std ?? 2) || (ind.std ?? 2) <= 0)) {
-      errors.push(`${label}：BOLL 标准差倍数需 > 0`);
+      errors.push({ targetId: ind.id, message: `${label}：BOLL 标准差倍数需 > 0` });
     }
   });
   return errors;
@@ -63,29 +70,27 @@ function outputAllowed(kind: keyof typeof INDICATOR_META, output: IndicatorOutpu
   return (INDICATOR_META[kind]?.outputs ?? []).includes(output);
 }
 
-function validateRules(config: BuilderConfig, varByIndicator: Map<string, MetricVarInfo>): string[] {
-  const errors: string[] = [];
+function validateRules(config: BuilderConfig, varByIndicator: Map<string, MetricVarInfo>): BuilderError[] {
+  const errors: BuilderError[] = [];
   config.rules.forEach((rule, i) => {
     const label = `规则 #${i + 1}`;
     if (rule.open === null && rule.close === null) {
-      errors.push(`${label}：至少配置一个动作（开仓或平仓）`);
+      errors.push({ targetId: rule.id, message: `${label}：至少配置一个动作（开仓或平仓）` });
     }
     if (config.direction === 'long_only' && (rule.open === 'sell' || rule.close === 'sell')) {
-      errors.push(`${label}：方向限制为「仅做多」，不能配置做空动作`);
+      errors.push({ targetId: rule.id, message: `${label}：方向限制为「仅做多」，不能配置做空动作` });
     }
     if (config.direction === 'short_only' && (rule.open === 'buy' || rule.close === 'buy')) {
-      errors.push(`${label}：方向限制为「仅做空」，不能配置做多动作`);
+      errors.push({ targetId: rule.id, message: `${label}：方向限制为「仅做空」，不能配置做多动作` });
     }
     for (const side of ['left', 'right'] as const) {
       const operand = rule[side];
       if (operand.type === 'indicator') {
         const info = varByIndicator.get(operand.indicatorId);
         if (!info) {
-          errors.push(`${label}：${side === 'left' ? '左' : '右'}操作数引用了已删除的指标`);
+          errors.push({ targetId: rule.id, message: `${label}：${side === 'left' ? '左' : '右'}操作数引用了已删除的指标` });
         } else if (!outputAllowed(info.block.kind, operand.output)) {
-          errors.push(
-            `${label}：${info.block.kind} 不支持输出通道 ${operand.output}`,
-          );
+          errors.push({ targetId: rule.id, message: `${label}：${info.block.kind} 不支持输出通道 ${operand.output}` });
         }
       }
     }
@@ -279,10 +284,10 @@ export function generateStrategyCode(
   config: BuilderConfig,
   name = '可视化构建策略',
 ): CodegenResult {
-  const errors: string[] = [];
-  if (!config.symbol.trim()) errors.push('品种不能为空');
-  if (!Number.isFinite(config.volume) || config.volume <= 0) errors.push('手数必须大于 0');
-  if (!config.timeframe.trim()) errors.push('周期不能为空');
+  const errors: BuilderError[] = [];
+  if (!config.symbol.trim()) errors.push({ message: '品种不能为空' });
+  if (!Number.isFinite(config.volume) || config.volume <= 0) errors.push({ message: '手数必须大于 0' });
+  if (!config.timeframe.trim()) errors.push({ message: '周期不能为空' });
 
   errors.push(...validateIndicators(config.indicators));
 
@@ -396,7 +401,12 @@ export function generateStrategyCode(
     push(`${INDENT1}# 规则 ${i + 1}: ${opDescription(rule, exprCtx)}`);
     push(`${INDENT1}positions = ctx.get_positions()`);
     push(`${INDENT1}if ${conditionExpr(rule, exprCtx)}:`);
-    emitActions(push, rule, config.direction);
+    emitActions(push, rule, config.direction, config);
+  }
+
+  // ── P3 风控：SL / TP 检查（每根 K 线规则之后统一扫一遍所有持仓） ──
+  if (config.risk_blocks && config.risk_blocks.length > 0) {
+    emitRiskChecks(push, config.risk_blocks);
   }
 
   // ── on_order / on_stop（validator 必需回调）
@@ -522,12 +532,14 @@ function emitActions(
   push: (...l: string[]) => void,
   rule: Rule,
   _direction: BuilderConfig['direction'],
+  config: BuilderConfig,
 ): void {
   const IND2 = INDENT2;
   const IND3 = INDENT3;
   const IND4 = INDENT3 + INDENT1;
   const IND5 = IND4 + INDENT1;
-  // 先平后开：反手（平多 + 开空）语义正确；平仓后刷新持仓快照
+
+  // ── 先平后开：反手（平多 + 开空）语义正确；平仓后刷新持仓快照 ──
   if (rule.close) {
     push(`${IND2}for pos in positions:`);
     push(`${IND3}if pos.direction == "${rule.close}":`);
@@ -537,13 +549,128 @@ function emitActions(
     push(`${IND5}ctx.log.warn(f"close failed: {result.error_code} - {result.error_message}")`);
     if (rule.open) push(`${IND2}positions = ctx.get_positions()`);
   }
+
   if (rule.open) {
     const verb = rule.open === 'buy' ? 'open long' : 'open short';
     const fn = rule.open === 'buy' ? 'buy' : 'sell';
-    push(`${IND2}if not positions:`);
+    const volExpr = emitVolumeExpr(config);
+    // P3: entry gate — max_position_count 从 risk_blocks 取，缺省 1（即一次一仓，等价旧 if not positions）
+    const maxCount = config.risk_blocks?.find((rb) => rb.kind === 'max_position_count')?.count ?? 1;
+    push(`${IND2}if len(positions) < ${maxCount}:`);
     push(`${IND3}ctx.log.info("BUILD: ${verb}")`);
-    push(`${IND3}result = ctx.${fn}(ctx.symbol, float(p["volume"]))`);
+    // risk_percent 模式下 volume 计算可能抛 ValueError，加 try 保护
+    if (config.sizing?.kind === 'risk_percent') {
+      push(`${IND3}try:`);
+      push(`${IND4}_vol = ${volExpr}`);
+      push(`${IND4}if _vol <= 0:`);
+      push(`${IND5}ctx.log.warn("risk_percent 计算出 volume <= 0，跳过开仓")`);
+      push(`${IND5}continue`);
+      push(`${IND3}except (ValueError, ZeroDivisionError) as _e:`);
+      push(`${IND4}ctx.log.warn(f"risk_percent volume 计算失败: {_e}")`);
+      push(`${IND4}continue`);
+      push(`${IND3}result = ctx.${fn}(ctx.symbol, _vol)`);
+    } else {
+      push(`${IND3}result = ctx.${fn}(ctx.symbol, float(${volExpr}))`);
+    }
     push(`${IND3}if not result.success:`);
     push(`${IND4}ctx.log.warn(f"${fn} failed: {result.error_code} - {result.error_message}")`);
   }
+}
+
+/** 生成开仓手数的表达式字符串。 */
+function emitVolumeExpr(config: BuilderConfig): string {
+  const s = config.sizing;
+  if (!s) return 'p["volume"]';
+  if (s.kind === 'fixed') return JSON.stringify(s.volume);
+  // risk_percent
+  // volume = (equity * rp%%) / (sl_pips * point * contract_size)
+  // Python 沙箱 API：ctx.get_account().equity / ctx.get_symbol_info(ctx.symbol).point / .contract_size
+  const rp = s.risk_percent / 100;
+  const sl = s.sl_pips;
+  return `(ctx.get_account().equity * ${formatNumber(rp)}) / (${sl} * ctx.get_symbol_info(ctx.symbol).point * ctx.get_symbol_info(ctx.symbol).contract_size)`;
+}
+
+/**
+ * 生成 SL/TP 风控代码：遍历 positions，检查每种风控条件，
+ * 触发时 ctx.close(pos.id) 平仓。放在 on_bar 规则之后、return 之前。
+ *
+ * pips 转换为绝对价格差：long 的 SL = open - pips*pip_size；TP = open + pips*pip_size；short 反之。
+ * bar.close 在沙箱里已由 positions 的 current_price 等价，直接用 pos.current_price 比较。
+ */
+function emitRiskChecks(push: (...l: string[]) => void, riskBlocks: RiskBlock[]): void {
+  const IND1 = INDENT1;
+  const IND2 = INDENT2;
+  const IND3 = INDENT3;
+  const IND4 = INDENT3 + INDENT1;
+
+  push('');
+  push(`${IND1}# ── P3 风控检查 ──`);
+  push(`${IND1}positions = ctx.get_positions()`);
+  push(`${IND1}for pos in positions:`);
+
+  for (const block of riskBlocks) {
+    if (block.kind === 'stop_loss') {
+      const abs = `${block.pips} * ctx.get_symbol_info(ctx.symbol).point`;
+      push(`${IND2}# SL ${block.pips} pips`);
+      push(`${IND2}if pos.direction == "buy" and pos.current_price <= pos.open_price - ${abs}:`);
+      push(`${IND3}ctx.log.info(f"SL hit long {pos.id}: open={pos.open_price} cur={pos.current_price}")`);
+      push(`${IND3}ctx.close(pos.id)`);
+      push(`${IND2}if pos.direction == "sell" and pos.current_price >= pos.open_price + ${abs}:`);
+      push(`${IND3}ctx.log.info(f"SL hit short {pos.id}: open={pos.open_price} cur={pos.current_price}")`);
+      push(`${IND3}ctx.close(pos.id)`);
+    } else if (block.kind === 'take_profit') {
+      const abs = `${block.pips} * ctx.get_symbol_info(ctx.symbol).point`;
+      push(`${IND2}# TP ${block.pips} pips`);
+      push(`${IND2}if pos.direction == "buy" and pos.current_price >= pos.open_price + ${abs}:`);
+      push(`${IND3}ctx.log.info(f"TP hit long {pos.id}: open={pos.open_price} cur={pos.current_price}")`);
+      push(`${IND3}ctx.close(pos.id)`);
+      push(`${IND2}if pos.direction == "sell" and pos.current_price <= pos.open_price - ${abs}:`);
+      push(`${IND3}ctx.log.info(f"TP hit short {pos.id}: open={pos.open_price} cur={pos.current_price}")`);
+      push(`${IND3}ctx.close(pos.id)`);
+    } else if (block.kind === 'trailing_stop') {
+      const trailAbs = `${block.pips} * ctx.get_symbol_info(ctx.symbol).point`;
+      const key = `trail_${block.id}`;
+      push(`${IND2}# Trailing Stop ${block.pips} pips（track extremum）`);
+      // 初始化：首次遇到该持仓，记录入场价为当前极值
+      push(`${IND2}_tkey = f"${key}_{pos.id}"`);
+      push(`${IND2}if _tkey not in ctx.storage:`);
+      push(`${IND3}ctx.storage[_tkey] = pos.open_price`);
+      push(`${IND2}_ext = ctx.storage[_tkey]`);
+      // long：跟踪最高价；short：跟踪最低价
+      push(`${IND2}if pos.direction == "buy":`);
+      push(`${IND3}_ext = max(_ext, pos.current_price)`);
+      push(`${IND3}ctx.storage[_tkey] = _ext`);
+      push(`${IND3}if pos.current_price <= _ext - ${trailAbs}:`);
+      push(`${IND4}ctx.log.info(f"TRAIL hit long {pos.id}: ext={_ext} cur={pos.current_price}")`);
+      push(`${IND4}ctx.close(pos.id)`);
+      push(`${IND4}del ctx.storage[_tkey]`);
+      push(`${IND2}elif pos.direction == "sell":`);
+      push(`${IND3}_ext = min(_ext, pos.current_price)`);
+      push(`${IND3}ctx.storage[_tkey] = _ext`);
+      push(`${IND3}if pos.current_price >= _ext + ${trailAbs}:`);
+      push(`${IND4}ctx.log.info(f"TRAIL hit short {pos.id}: ext={_ext} cur={pos.current_price}")`);
+      push(`${IND4}ctx.close(pos.id)`);
+      push(`${IND4}del ctx.storage[_tkey]`);
+    } else if (block.kind === 'max_holding_time') {
+      push(`${IND2}# Max Holding ${block.minutes} min`);
+      push(`${IND2}_opened = pos.opened_at`);
+      push(`${IND2}_elapsed_min = (ctx.now - _opened).total_seconds() / 60.0`);
+      push(`${IND2}if _elapsed_min >= ${block.minutes}:`);
+      push(`${IND3}ctx.log.info(f"MAX_HOLD hit {pos.id}: elapsed={_elapsed_min:.1f}min >= ${block.minutes}")`);
+      push(`${IND3}ctx.close(pos.id)`);
+    } else if (block.kind === 'daily_drawdown_cut') {
+      push(`${IND2}# daily_drawdown_cut (${block.percent}%) — 账户级风控，待接入`);
+    } else if (block.kind === 'cooldown') {
+      push(`${IND2}# cooldown (${block.minutes} min) — 账户级风控，待接入`);
+    }
+    // max_position_count 是 entry gate，在 emitActions 开仓分支处理，不在此生成持仓检查代码
+  }
+
+  // 清理已平仓但 storage 里残留的 trailing key
+  push(`${IND1}_live_ids = {p.id for p in positions}`);
+  push(`${IND1}for _k in list(ctx.storage.keys()):`);
+  push(`${IND2}if _k.startswith("trail_") and not any(_k.endswith("_" + _id) for _id in _live_ids):`);
+  push(`${IND3}del ctx.storage[_k]`);
+
+  push(`${IND1}# 风控完成`);
 }

@@ -4,7 +4,10 @@ import {
   AlertTriangle,
   ArrowLeft,
   Check,
+  ChevronDown,
+  ChevronUp,
   GripVertical,
+  Info,
   Loader2,
   Plus,
   Save,
@@ -13,9 +16,9 @@ import {
 } from 'lucide-react';
 import Editor from '@monaco-editor/react';
 import '@/lib/monacoSetup';
-import { useCreateStrategy, useSaveSource, useStrategy, useUpdateStrategy } from '@/hooks/useStrategies';
+import { useCreateStrategy, useSaveBuilder, useStrategy } from '@/hooks/useStrategies';
 import { apiError } from '@/lib/api';
-import { generateStrategyCode } from '@/lib/builder/codegen';
+import { generateStrategyCode, type BuilderError } from '@/lib/builder/codegen';
 import {
   emptyConfig,
   INDICATOR_META,
@@ -29,8 +32,17 @@ import {
   type IndicatorKind,
   type IndicatorOutput,
   type Operand,
+  type PositionSizing,
   type Rule,
 } from '@/lib/builder/types';
+
+/** SHA-256 hex digest（与后端 _source_hash 实现一致）。 */
+async function sha256(source: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
 
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1'];
 
@@ -138,8 +150,7 @@ export default function BuilderPage({ mode }: Props) {
   const navigate = useNavigate();
   const strategyQuery = useStrategy(mode === 'edit' ? id : undefined);
   const create = useCreateStrategy();
-  const update = useUpdateStrategy();
-  const saveSource = useSaveSource();
+  const saveBuilder = useSaveBuilder();
 
   const [config, setConfig] = useState<BuilderConfig>(emptyConfig());
   const [configLoaded, setConfigLoaded] = useState(false);
@@ -147,6 +158,10 @@ export default function BuilderPage({ mode }: Props) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [savedTip, setSavedTip] = useState(false);
+  const [generatedHash, setGeneratedHash] = useState<string | null>(null);
+  const [semanticsOpen, setSemanticsOpen] = useState(false);
+  const [serverErrors, setServerErrors] = useState<BuilderError[]>([]);
+  const [mobileTab, setMobileTab] = useState<'palette' | 'canvas' | 'code'>('canvas');
 
   // 编辑模式：加载既有 builder_config（无配置 → 空白 + 覆盖警示）
   const strategy = strategyQuery.data;
@@ -159,16 +174,38 @@ export default function BuilderPage({ mode }: Props) {
 
   const dragRef = useRef<{ layer: 'indicators' | 'rules'; index: number } | null>(null);
 
+  // 每次生成代码变化时算 SHA-256（用于脱离检测）
   const generated = useMemo(() => generateStrategyCode(config, name || '可视化构建策略'), [config, name]);
+  useEffect(() => {
+    sha256(generated.code).then(setGeneratedHash);
+  }, [generated.code]);
   const hasErrors = generated.errors.length > 0;
 
+  // P2：合并前端 codegen + 后端 422 返回的结构化错误，用于卡片级高亮
+  const combinedErrors = useMemo(
+    () => [...generated.errors, ...serverErrors],
+    [generated.errors, serverErrors],
+  );
+  const errorTargetIds = useMemo(
+    () => new Set(combinedErrors.filter((e) => e.targetId).map((e) => e.targetId)),
+    [combinedErrors],
+  );
+
+  // 脱离检测：后端存的 hash 与当前 builder 生成的 hash 不一致 → 源码被手动改过
+  // null 情况：旧策略迁移、或还没保存过（首次进入构建器）→ 不强制警告
+  const divergence =
+    mode === 'edit' && !!strategy?.source_code_hash && generatedHash !== null
+      ? strategy.source_code_hash !== generatedHash
+      : false;
+
   const archived = strategy?.status === 'archived';
-  const busy = create.isPending || update.isPending || saveSource.isPending;
+  const busy = create.isPending || saveBuilder.isPending;
 
   // ── config 修改工具
   const patch = useCallback((fn: (c: BuilderConfig) => BuilderConfig) => {
     setConfig((c) => fn(structuredClone(c)));
     setSavedTip(false);
+    setServerErrors([]);  // config 变化后清除后端错误
   }, []);
 
   const addIndicator = (kind: IndicatorKind) => {
@@ -269,33 +306,45 @@ export default function BuilderPage({ mode }: Props) {
 
   const doSaveEdit = () => {
     if (!id || hasErrors || busy || archived) return;
-    saveSource.mutate(
-      { id, source_code: generated.code, base_updated_at: null },
+    saveBuilder.mutate(
+      {
+        id,
+        payload: {
+          source_code: generated.code,
+          builder_config: config,
+          direction: config.direction,
+          symbol_ids: [config.symbol],
+          timeframe: config.timeframe,
+          base_updated_at: strategy?.updated_at ?? null,
+        },
+      },
       {
         onSuccess: () => {
-          update.mutate(
-            {
-              id,
-              body: {
-                direction: config.direction,
-                symbol_ids: [config.symbol],
-                timeframe: config.timeframe,
-                builder_config: config,
-              },
-            },
-            {
-              onSuccess: () => {
-                setSavedTip(true);
-                void strategyQuery.refetch();
-              },
-            },
-          );
+          setSavedTip(true);
+          void strategyQuery.refetch();
+        },
+        onError: (err) => {
+          // 409 冲突：提示刷新
+          // 422 builder_config / source_code：解析结构化错误用于卡片高亮
+          const detail = apiError(err);
+          if (detail.includes('409') || detail.includes('已在其他窗口')) {
+            alert('策略已在其他窗口被修改，请刷新后重试。');
+            return;
+          }
+          // 解析后端返回的结构化 builder errors
+          const respData = (err as { response?: { data?: { detail?: { errors?: BuilderError[]; type?: string } } } })
+            .response?.data?.detail;
+          if (respData?.type === 'builder_config' && Array.isArray(respData.errors)) {
+            setServerErrors(respData.errors);
+          }
         },
       },
     );
   };
 
-  const showOverwriteWarning = mode === 'edit' && strategy?.builder_config == null;
+  // 覆盖警示：builder_config 缺失（手工策略）OR 源码已脱离（手动改过）
+  const showOverwriteWarning =
+    mode === 'edit' && (strategy?.builder_config == null || divergence);
   if (mode === 'edit' && strategyQuery.isLoading) {
     return (
       <div className="card">
@@ -371,25 +420,48 @@ export default function BuilderPage({ mode }: Props) {
         </div>
       </div>
 
-      {showOverwriteWarning && (
+      {(showOverwriteWarning || divergence) && (
         <div className="px-3 py-2 rounded bg-yellow-500/10 border border-yellow-500/30 text-xs text-yellow-400 shrink-0 flex items-center gap-2">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-          该策略不含构建器配置（手工编写或已脱离），保存将用生成代码覆盖现有源码。
+          {divergence
+            ? '当前源码与积木配置已脱离（源码可能被手动修改过），保存将用构建器生成代码覆盖现有源码。'
+            : '该策略不含构建器配置（手工编写），保存将用生成代码覆盖现有源码。'}
         </div>
       )}
 
       {hasErrors && (
         <div className="px-3 py-2 rounded bg-loss/10 border border-loss/30 text-xs text-loss shrink-0 space-y-0.5">
           {generated.errors.map((e, i) => (
-            <p key={i}>· {e}</p>
+            <p key={i}>· {e.message}</p>
           ))}
         </div>
       )}
 
-      {/* 三栏主体（md 起 220px 面板 + 42% 预览，保证 1020px 视口可用） */}
+      {/* 三栏主体（md 起始终可见；移动端由 tab 切换） */}
+      {/* 移动端 tab bar */}
+      <div className="md:hidden flex gap-1 px-2 pb-1 border-b border-gray-700/50 shrink-0">
+        {[
+          { k: 'palette' as const, label: '🧩 积木' },
+          { k: 'canvas' as const, label: '📐 画布' },
+          { k: 'code' as const, label: '💻 代码' },
+        ].map((t) => (
+          <button
+            key={t.k}
+            type="button"
+            className={`flex-1 py-1.5 text-xs rounded transition-colors ${
+              mobileTab === t.k
+                ? 'bg-gray-700 text-white font-medium'
+                : 'text-gray-500 hover:text-gray-300 hover:bg-gray-800'
+            }`}
+            onClick={() => setMobileTab(t.k)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
       <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-[220px_minmax(0,1fr)_minmax(0,42%)] gap-3">
         {/* 左：积木面板 */}
-        <div className="card flex flex-col overflow-y-auto min-h-0 hidden md:flex">
+        <div className={`card flex flex-col overflow-y-auto min-h-0 ${mobileTab === 'palette' ? 'flex' : 'hidden'} md:flex`}>
           <div className="card-body space-y-4 text-sm">
             <div>
               <p className="text-xs text-gray-400 font-medium mb-2">指标块（点击添加）</p>
@@ -430,7 +502,7 @@ export default function BuilderPage({ mode }: Props) {
         </div>
 
         {/* 中：画布 */}
-        <div className="min-h-0 overflow-y-auto space-y-3 pr-0.5">
+        <div className={`min-h-0 overflow-y-auto space-y-3 pr-0.5 ${mobileTab === 'canvas' ? 'block' : 'hidden'} md:block`}>
           {/* 全局配置 */}
           <div className="card">
             <div className="card-body grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -455,17 +527,6 @@ export default function BuilderPage({ mode }: Props) {
                 </select>
               </label>
               <label className="block">
-                <span className="text-xs text-gray-400">手数</span>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0.01"
-                  className="input-dark mt-1 font-mono"
-                  value={config.volume}
-                  onChange={(e) => patch((c) => ({ ...c, volume: Number(e.target.value) }))}
-                />
-              </label>
-              <label className="block">
                 <span className="text-xs text-gray-400">方向限制</span>
                 <select
                   className="input-dark mt-1"
@@ -477,6 +538,58 @@ export default function BuilderPage({ mode }: Props) {
                   ))}
                 </select>
               </label>
+              <label className="block">
+                <span className="text-xs text-gray-400">仓位模式</span>
+                <select
+                  className="input-dark mt-1"
+                  value={config.sizing?.kind ?? 'legacy'}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    patch((c) => {
+                      if (v === 'legacy') return { ...c, sizing: undefined };
+                      if (v === 'fixed') return { ...c, sizing: { kind: 'fixed', volume: c.volume } };
+                      return { ...c, sizing: { kind: 'risk_percent', risk_percent: 1, sl_pips: 50 } };
+                    });
+                  }}
+                >
+                  <option value="legacy">固定手数（{config.volume}）</option>
+                  <option value="fixed">固定手数（可配置）</option>
+                  <option value="risk_percent">风险比例</option>
+                </select>
+              </label>
+              {config.sizing?.kind === 'fixed' && (
+                <label className="block">
+                  <span className="text-xs text-gray-400">固定手数</span>
+                  <input
+                    type="number" step="0.01" min="0.01"
+                    className="input-dark mt-1 font-mono"
+                    value={config.sizing.volume}
+                    onChange={(e) => patch((c) => ({ ...c, sizing: { ...(c.sizing as PositionSizing), volume: Number(e.target.value) } }))}
+                  />
+                </label>
+              )}
+              {config.sizing?.kind === 'risk_percent' && (
+                <>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">风险比例 (%)</span>
+                    <input
+                      type="number" step="0.1" min="0.1" max="100"
+                      className="input-dark mt-1 font-mono"
+                      value={config.sizing.risk_percent}
+                      onChange={(e) => patch((c) => ({ ...c, sizing: { ...(c.sizing as PositionSizing), risk_percent: Number(e.target.value) } }))}
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">用于反推的 SL (pips)</span>
+                    <input
+                      type="number" step="1" min="1"
+                      className="input-dark mt-1 font-mono"
+                      value={config.sizing.sl_pips}
+                      onChange={(e) => patch((c) => ({ ...c, sizing: { ...(c.sizing as PositionSizing), sl_pips: Number(e.target.value) } }))}
+                    />
+                  </label>
+                </>
+              )}
             </div>
           </div>
 
@@ -496,17 +609,24 @@ export default function BuilderPage({ mode }: Props) {
                     : ind.kind === 'BOLL'
                       ? `${ind.period}×${ind.std}`
                       : String(ind.period);
+                const hasErr = errorTargetIds.has(ind.id);
                 return (
                   <div
                     key={ind.id}
                     {...dragProps('indicators', i)}
-                    className="flex items-center gap-2 flex-wrap px-2.5 py-2 rounded border border-gray-700 bg-surface-900 cursor-grab active:cursor-grabbing"
+                    className={`flex items-center gap-2 flex-wrap px-2.5 py-2 rounded border ${
+                      hasErr
+                        ? 'border-loss bg-loss/10'
+                        : 'border-gray-700 bg-surface-900'
+                    } cursor-grab active:cursor-grabbing`}
+                    title={hasErr ? combinedErrors.filter((e) => e.targetId === ind.id).map((e) => e.message).join('\n') : undefined}
                   >
-                    <GripVertical className="w-3.5 h-3.5 text-gray-600 shrink-0" />
+                    <GripVertical className={`w-3.5 h-3.5 ${hasErr ? 'text-loss' : 'text-gray-600'} shrink-0`} />
+                    {hasErr && <AlertTriangle className="w-3.5 h-3.5 text-loss shrink-0" />}
                     <span className="text-xs font-mono text-blue-300 shrink-0">
                       {ind.kind.toLowerCase()}_{i + 1}
                     </span>
-                    <span className="text-xs text-gray-400 shrink-0">{INDICATOR_META[ind.kind].label}</span>
+                    <span className={`text-xs ${hasErr ? 'text-loss/80' : 'text-gray-400'} shrink-0`}>{INDICATOR_META[ind.kind].label}</span>
                     {ind.kind === 'MACD' ? (
                       <>
                         <NumField label="快" value={ind.fast ?? 12} min={2} onChange={(v) => updateIndicator(ind.id, { fast: v })} />
@@ -548,25 +668,53 @@ export default function BuilderPage({ mode }: Props) {
           {/* 规则层 */}
           <div className="card">
             <div className="card-header flex items-center justify-between">
-              <span className="text-xs text-gray-300 font-medium">规则层（{config.rules.length}）</span>
+              <button
+                type="button"
+                className="flex items-center gap-1 text-xs text-gray-300 font-medium hover:text-gray-200"
+                onClick={() => setSemanticsOpen((v) => !v)}
+              >
+                规则层（{config.rules.length}）
+                <Info className="w-3.5 h-3.5 text-gray-500" />
+                {semanticsOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+              </button>
               {config.rules.length === 0 && config.indicators.length > 0 && (
                 <button type="button" className="btn-ghost text-xs" onClick={() => addRule('cross_above')}>
                   <Plus className="w-3 h-3" /> 新增规则
                 </button>
               )}
             </div>
+            {semanticsOpen && (
+              <div className="px-3 py-2 text-2xs text-gray-400 leading-relaxed border-b border-gray-700/50 bg-gray-900/30">
+                <p className="mb-1 font-medium text-gray-300">执行语义（线性规则列表）</p>
+                <ul className="space-y-0.5 list-disc list-inside">
+                  <li>规则按列表顺序 <span className="text-gray-300">自上而下</span> 逐条检查。</li>
+                  <li>同一根 K 线内多条规则同时触发时，<span className="text-gray-300">先平后开</span>：先执行所有平仓动作，再执行所有开仓动作。</li>
+                  <li>开仓仅在 <span className="text-gray-300">无对应方向持仓</span> 时执行；平仓仅在 <span className="text-gray-300">有对应方向持仓</span> 时执行。</li>
+                  <li>若开启了方向限制（如仅做多），所有规则的开仓/平仓动作都会被校验是否匹配方向。</li>
+                  <li>订单失败（余额不足、点差过大等）会跳过该订单，不会中断策略运行。</li>
+                </ul>
+              </div>
+            )}
             <div className="card-body space-y-2">
               {config.rules.length === 0 && (
                 <p className="text-xs text-gray-600 py-3 text-center">从左侧面板添加条件块（上穿 / 下穿 / 大于 / 小于）</p>
               )}
-              {config.rules.map((rule, i) => (
-                <div
-                  key={rule.id}
-                  {...dragProps('rules', i)}
-                  className="px-2.5 py-2 rounded border border-gray-700 bg-surface-900 cursor-grab active:cursor-grabbing space-y-2"
-                >
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <GripVertical className="w-3.5 h-3.5 text-gray-600 shrink-0" />
+              {config.rules.map((rule, i) => {
+                const hasErr = errorTargetIds.has(rule.id);
+                return (
+                  <div
+                    key={rule.id}
+                    {...dragProps('rules', i)}
+                    className={`px-2.5 py-2 rounded border ${
+                      hasErr
+                        ? 'border-loss bg-loss/10'
+                        : 'border-gray-700 bg-surface-900'
+                    } cursor-grab active:cursor-grabbing space-y-2`}
+                    title={hasErr ? combinedErrors.filter((e) => e.targetId === rule.id).map((e) => e.message).join('\n') : undefined}
+                  >
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <GripVertical className={`w-3.5 h-3.5 ${hasErr ? 'text-loss' : 'text-gray-600'} shrink-0`} />
+                      {hasErr && <AlertTriangle className="w-3.5 h-3.5 text-loss shrink-0" />}
                     <span className="text-xs text-gray-500 shrink-0">#{i + 1}</span>
                     <select
                       className="input-dark w-24 text-xs px-1.5 py-1"
@@ -612,13 +760,136 @@ export default function BuilderPage({ mode }: Props) {
                     <span className="text-2xs text-gray-600">开仓仅在有持仓可平/无持仓时执行，先平后开</span>
                   </div>
                 </div>
-              ))}
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 风控层（P3） */}
+          <div className="card">
+            <div className="card-header flex items-center justify-between">
+              <span className="text-xs text-gray-300 font-medium">风控层（{config.risk_blocks?.length ?? 0}）</span>
+              <div className="flex gap-1.5">
+                <button
+                  type="button" className="btn-ghost text-xs px-2 py-1 hover:text-loss"
+                  onClick={() => patch((c) => ({ ...c, risk_blocks: [...(c.risk_blocks ?? []), { id: newId('risk'), kind: 'stop_loss', pips: 50 }] }))}
+                >+ 止损</button>
+                <button
+                  type="button" className="btn-ghost text-xs px-2 py-1 hover:text-profit"
+                  onClick={() => patch((c) => ({ ...c, risk_blocks: [...(c.risk_blocks ?? []), { id: newId('risk'), kind: 'take_profit', pips: 100 }] }))}
+                >+ 止盈</button>
+                <button
+                  type="button" className="btn-ghost text-xs px-2 py-1"
+                  onClick={() => patch((c) => ({ ...c, risk_blocks: [...(c.risk_blocks ?? []), { id: newId('risk'), kind: 'trailing_stop', pips: 30 }] }))}
+                  title="跟随极值的移动止损"
+                >+ 移动止损</button>
+                <button
+                  type="button" className="btn-ghost text-xs px-2 py-1"
+                  onClick={() => patch((c) => ({ ...c, risk_blocks: [...(c.risk_blocks ?? []), { id: newId('risk'), kind: 'max_holding_time', minutes: 1440 }] }))}
+                  title="超过指定时长强制平仓"
+                >+ 最长持仓</button>
+                <button
+                  type="button" className="btn-ghost text-xs px-2 py-1"
+                  onClick={() => patch((c) => ({ ...c, risk_blocks: [...(c.risk_blocks ?? []), { id: newId('risk'), kind: 'max_position_count', count: 1 }] }))}
+                  title="最多同时持仓数（开仓前检查）"
+                >+ 最大持仓</button>
+              </div>
+            </div>
+            <div className="card-body space-y-2">
+              {(config.risk_blocks?.length ?? 0) === 0 && (
+                <p className="text-xs text-gray-600 py-2 text-center">暂未配置风控。上方按钮快速添加止损/止盈/移动止损/最长持仓。</p>
+              )}
+              {(config.risk_blocks ?? []).map((block) => {
+                const hasErr = errorTargetIds.has(block.id);
+                const isSL = block.kind === 'stop_loss';
+                const isTP = block.kind === 'take_profit';
+                const isTrail = block.kind === 'trailing_stop';
+                const isMaxHold = block.kind === 'max_holding_time';
+                const isMaxCount = block.kind === 'max_position_count';
+                return (
+                  <div
+                    key={block.id}
+                    className={`flex items-center gap-2 flex-wrap px-2.5 py-2 rounded border ${
+                      hasErr ? 'border-loss bg-loss/10' : 'border-gray-700 bg-surface-900'
+                    }`}
+                    title={hasErr ? combinedErrors.filter((e) => e.targetId === block.id).map((e) => e.message).join('\n') : undefined}
+                  >
+                    <span className={`text-xs font-medium ${
+                      isSL ? 'text-loss' : isTP ? 'text-profit' : isTrail ? 'text-yellow-400' : isMaxHold ? 'text-cyan-400' : isMaxCount ? 'text-purple-400' : 'text-gray-400'
+                    }`}>
+                      {isSL ? '🛑 止损' : isTP ? '🎯 止盈' : isTrail ? '〰️ 移动止损' : isMaxHold ? '⏱ 最长持仓' : isMaxCount ? '🔢 最大持仓' : '🔒 账户级（待接入）'}
+                    </span>
+                    {(isSL || isTP || isTrail) && (
+                      <>
+                        <span className="text-xs text-gray-500">pips</span>
+                        <input
+                          type="number" step="1" min="1"
+                          className="input-dark w-20 text-xs px-1.5 py-1 font-mono"
+                          value={block.pips}
+                          onChange={(e) => patch((c) => ({
+                            ...c,
+                            risk_blocks: (c.risk_blocks ?? []).map((b) =>
+                              b.id === block.id ? { ...b, pips: Number(e.target.value) } : b,
+                            ),
+                          }))}
+                        />
+                      </>
+                    )}
+                    {isMaxHold && (
+                      <>
+                        <span className="text-xs text-gray-500">分钟</span>
+                        <input
+                          type="number" step="10" min="1"
+                          className="input-dark w-24 text-xs px-1.5 py-1 font-mono"
+                          value={block.minutes}
+                          onChange={(e) => patch((c) => ({
+                            ...c,
+                            risk_blocks: (c.risk_blocks ?? []).map((b) =>
+                              b.id === block.id ? { ...b, minutes: Number(e.target.value) } : b,
+                            ),
+                          }))}
+                        />
+                      </>
+                    )}
+                    {isMaxCount && (
+                      <>
+                        <span className="text-xs text-gray-500">个</span>
+                        <input
+                          type="number" step="1" min="1"
+                          className="input-dark w-20 text-xs px-1.5 py-1 font-mono"
+                          value={block.count}
+                          onChange={(e) => patch((c) => ({
+                            ...c,
+                            risk_blocks: (c.risk_blocks ?? []).map((b) =>
+                              b.id === block.id ? { ...b, count: Math.max(1, Math.floor(Number(e.target.value))) } : b,
+                            ),
+                          }))}
+                        />
+                      </>
+                    )}
+                    <span className="text-2xs text-gray-500 ml-auto">
+                      {isSL ? '触及止损价平仓' : isTP ? '触及止盈价平仓' : isTrail ? '跟随最高/最低价回撤平仓' : isMaxHold ? '持仓超过指定时长强制平仓' : isMaxCount ? '开仓前检查，超过则跳过新仓' : '账户级风控，待接入账户数据后生效'}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-ghost p-1 text-loss hover:text-loss-light"
+                      title="删除风控"
+                      onClick={() => patch((c) => ({
+                        ...c,
+                        risk_blocks: (c.risk_blocks ?? []).filter((b) => b.id !== block.id),
+                      }))}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
 
         {/* 右：代码预览 */}
-        <div className="card flex flex-col overflow-hidden min-h-0 hidden md:flex">
+        <div className={`card flex flex-col overflow-hidden min-h-0 ${mobileTab === 'code' ? 'flex' : 'hidden'} md:flex`}>
           <div className="px-3 py-2 border-b border-gray-700/50 flex items-center justify-between shrink-0">
             <span className="text-xs text-gray-400">生成代码预览（只读）</span>
           </div>

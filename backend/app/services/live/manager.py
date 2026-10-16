@@ -53,6 +53,7 @@ from app.services.gateway_client import (
     GatewayClient,
     GatewayError,
     GatewayLoginError,
+    GatewayProtocolError,
     GatewayTimeout,
     GatewayTradeNotAllowed,
 )
@@ -656,6 +657,10 @@ class LiveManager(BaseRunManager[_RunHandle]):
             "commission": 0.0, "error_code": None, "error_message": None,
             "account": self._mirror_payload(h),
         }
+        # Set True after a successful post-timeout convergence — the mirror is
+        # already fresh from a *different* (fresh) client, so finally's
+        # redundant _refresh_mirror on the original client can be skipped.
+        mirror_already_fresh = False
         client = GatewayClient.for_registered_node(h.gateway_url or None)
         try:
             if op in ("buy", "sell"):
@@ -689,19 +694,44 @@ class LiveManager(BaseRunManager[_RunHandle]):
                 })
         except GatewayTimeout:
             # request reached the gateway but no response — outcome UNKNOWN.
-            # Do NOT retry; flag for reconciliation (Phase E converges it).
             out.update({
                 "error_code": "UNKNOWN_ERROR",
                 "error_message": "下单结果未知（网关超时），已转对账收敛",
             })
             await self._flag_reconcile(h.run_id)
+            # Emergency convergence: the broker-side state is unknown because
+            # the order might have filled before the HTTP timeout fired.  A
+            # fresh client gives us the current account+positions snapshot
+            # immediately, closing the reconcile gap before the 5-min cycle.
+            mirror_already_fresh = await self._force_converge_after_unknown(h)
+        except GatewayProtocolError as exc:
+            # Connection established but broke mid-request — outcome UNKNOWN.
+            # Same semantics as GatewayTimeout (request may have reached the
+            # broker and executed before the transport reset).  Converge now.
+            out.update({
+                "error_code": "UNKNOWN_ERROR",
+                "error_message": f"下单结果未知（网关协议中断），已转对账收敛：{exc.detail}",
+            })
+            await self._flag_reconcile(h.run_id)
+            mirror_already_fresh = await self._force_converge_after_unknown(h)
         except GatewayTradeNotAllowed as exc:
             out.update({"error_code": "RISK_BLOCKED", "error_message": exc.detail})
         except GatewayError as exc:
-            # connect refused / gateway down → the order was NOT sent.
+            # GatewayUnavailable only remains here (ConnectError — connect
+            # refused / DNS / TLS fail, or unknown HTTPError subclass).
+            # TCP handshake itself failed → order NEVER reached broker; no
+            # convergence needed.  Poll handles natural recovery.
             out.update({"error_code": "UNKNOWN_ERROR", "error_message": exc.detail})
         finally:
-            await self._refresh_mirror(h, client)
+            if mirror_already_fresh:
+                # Fresh client in the timeout handler already did this; the
+                # original (timed-out) client has nothing new to tell us.
+                logger.debug(
+                    "live %s mirror already refreshed by post-timeout convergence — "
+                    "skipping original-client refresh", h.run_id,
+                )
+            else:
+                await self._refresh_mirror(h, client)
             await client.aclose()
             out["account"] = self._mirror_payload(h)
 
@@ -896,6 +926,52 @@ class LiveManager(BaseRunManager[_RunHandle]):
                 db.add(run)
                 await db.commit()
 
+    async def _force_converge_after_unknown(self, h: _RunHandle) -> bool:
+        """Post-timeout emergency convergence — returns True on success.
+
+        Only called from the GatewayTimeout branch (order reached the broker
+        but we don't know if it filled).  GatewayError intentionally does NOT
+        call this — if the connection was refused, the order never reached the
+        broker, so the broker-side mirror cannot have changed because of it.
+
+        Creates a **fresh** gateway client (bypassing the one that just timed
+        out), pulls account + positions directly, writes into ``h``'s
+        in-memory mirror, and force-writes into DB so ``run.positions`` is
+        current — the throttle in ``_write_account`` is skipped because
+        ``force=True``.  We intentionally skip ``_push_account`` here; the
+        finally block below will still run its *own* refresh on the original
+        client, but that client is also unusable after a timeout so we flag
+        ``mirror_already_fresh`` upstream to skip that redundant call.
+        """
+        client = GatewayClient.for_registered_node(h.gateway_url or None)
+        try:
+            acc = await client.account()
+            positions = await client.positions()
+            # Symmetric with positions: gateway returning null/None for either
+            # field should be treated as "no update" on that field — don't
+            # keep a stale account snapshot when gateway says nothing new.
+            if acc:
+                h.account = acc
+            if not h.account:
+                h.account = {
+                    "equity": 0.0, "balance": 0.0,
+                    "margin": 0.0, "margin_free": 0.0,
+                }
+            h.positions = positions or []
+            await self._write_account(h.run_id, force=True, h=h)
+            return True
+        except (GatewayError, GatewayTimeout) as exc:
+            logger.warning(
+                "live %s post-timeout convergence failed (gateway still down): %s — "
+                "relying on reconcile cycle", h.run_id, exc.detail,
+            )
+            return False
+        except Exception:  # noqa: BLE001 — convergence must NOT bubble up
+            logger.exception("live %s post-timeout convergence unexpected error", h.run_id)
+            return False
+        finally:
+            await client.aclose()
+
     # ── broker mirror ──────────────────────────────────────────
 
     def _mirror_payload(self, h: _RunHandle) -> dict:
@@ -923,8 +999,19 @@ class LiveManager(BaseRunManager[_RunHandle]):
     async def _push_account(self, h: _RunHandle) -> None:
         await h.sup.send({"cmd": "account", "account": self._mirror_payload(h)})
 
-    async def _write_account(self, run_id: str, force: bool = False) -> None:
-        h = self._handles.get(run_id)
+    async def _write_account(
+        self, run_id: str, force: bool = False, h: _RunHandle | None = None,
+    ) -> None:
+        """Persist the handle's account + positions snapshot into the LiveRun row.
+
+        ``h`` is optional — when omitted the handle is looked up via
+        ``self._handles``, which is the normal path during poll/stream.
+        Passing ``h`` explicitly is used by ``_force_converge_after_unknown``
+        where the caller already has the handle and doesn't want it to vanish
+        from ``_handles`` between refresh and write.
+        """
+        if h is None:
+            h = self._handles.get(run_id)
         if h is None or not h.account:
             return
         if not force and time.monotonic() - h.last_account_write < _ACCOUNT_WRITE_INTERVAL:
@@ -966,6 +1053,92 @@ class LiveManager(BaseRunManager[_RunHandle]):
             db.add(run)
             await db.commit()
         h.last_account_write = time.monotonic()
+
+    async def flush_positions_for_account(self, account_id: str) -> int:
+        """Force-write every active handle's in-memory positions to DB.
+
+        Called by ``reconcile_once`` right before it reads the DB snapshot,
+        closing the race window where ``_ACCOUNT_WRITE_INTERVAL`` (2s) lets
+        ``run.positions`` lag the freshly-refreshed ``h.positions`` mirror
+        between two poll ticks.  No handles → returns 0 silently.
+
+        Optimization: reconcile_once iterates K accounts and calls us once
+        per account; instead of O(K × N) scans of ``_handles`` we do O(N)
+        total by grouping once and then O(1) account lookups.
+        """
+        if not self._handles:
+            return 0
+        # Single pass — group handles by account_id
+        grouped: dict[str, list[tuple[str, _RunHandle]]] = {}
+        for run_id, h in self._handles.items():
+            grouped.setdefault(h.account_id, []).append((run_id, h))
+        # O(1) fetch for this account
+        handles_for = grouped.get(account_id, [])
+        for run_id, h in handles_for:
+            await self._write_account(run_id, force=True, h=h)
+        return len(handles_for)
+
+    async def force_refresh_account(
+        self, account_id: str, *, client: GatewayClient | None = None,
+    ) -> dict:
+        """Pull account + positions directly from the gateway and force-write
+        every handle for ``account_id`` into DB.
+
+        Returns a dict:
+            {"ok": bool, "handles": int, "gateway_down": bool}
+
+        - ``ok``: at least one handle was refreshed successfully.
+        - ``handles``: number of handles found for this account (0 = no live runs
+          bound to this account in the process memory — possible race condition).
+        - ``gateway_down``: every handle's gateway call failed (GatewayError /
+          GatewayTimeout).  reconcile should treat this differently from a genuine
+          diff — skip freezing and let the next cycle retry after the gateway
+          recovers, instead of writing an irreversible trade_frozen=True row.
+
+        Called by ``reconcile_once`` after it found a diff (Step 3 auto-
+        converge).  If ``client`` is supplied (reconcile uses the same one
+        it already called ``positions()`` on), we avoid a redundant TCP
+        handshake; otherwise we create a fresh client per handle.
+        """
+        handles = [h for h in self._handles.values()
+                   if h.account_id == account_id]
+        if not handles:
+            return {"ok": False, "handles": 0, "gateway_down": False}
+        n_ok = 0
+        n_gw_fail = 0
+        shared_client = client is not None
+        for h in handles:
+            gc = client if shared_client else GatewayClient.for_registered_node(
+                h.gateway_url or None,
+            )
+            try:
+                acc = await gc.account()
+                positions = await gc.positions()
+                if acc:
+                    h.account = acc
+                if not h.account:
+                    h.account = {
+                        "equity": 0.0, "balance": 0.0,
+                        "margin": 0.0, "margin_free": 0.0,
+                    }
+                h.positions = positions or []
+                await self._write_account(h.run_id, force=True, h=h)
+                n_ok += 1
+            except (GatewayError, GatewayTimeout):
+                n_gw_fail += 1
+                logger.warning(
+                    "live %s force_refresh_account gateway call failed", h.run_id,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "live %s force_refresh_account unexpected error", h.run_id,
+                )
+            finally:
+                if not shared_client:
+                    await gc.aclose()
+        gateway_down = (n_gw_fail > 0 and n_ok == 0)
+        return {"ok": n_ok > 0, "handles": len(handles),
+                "gateway_down": gateway_down}
 
     async def _flush_rows(self, run_id: str) -> None:
         h = self._handles.get(run_id)

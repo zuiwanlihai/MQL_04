@@ -18,6 +18,7 @@ import {
 import { useStrategies } from '@/hooks/useStrategies';
 import { useKlines, useQuotesStream } from '@/hooks/useMarket';
 import { PriceLadderChart } from '@/components/trading/PriceLadderChart';
+import { GridLevelTable } from '@/components/trading/GridLevelTable';
 import { resolvePlaybook } from '@/lib/strategyPlaybook';
 import { apiError } from '@/lib/api';
 import type { LiveRunStatus, MarketTimeframe } from '@/types/api';
@@ -101,8 +102,8 @@ export default function LiveDetailPage() {
   const readmit = useReAdmit();
 
   const [tab, setTab] = useState<
-    'chart' | 'positions' | 'trades' | 'deviation' | 'logs' | 'config' | 'playbook'
-  >('chart');
+    'equity' | 'aiNames' | 'positions' | 'trades' | 'deviation' | 'logs' | 'config' | 'playbook'
+  >('equity');
   const [vh, setVh] = useState(() => window.innerHeight);
   useEffect(() => {
     const onResize = () => setVh(window.innerHeight);
@@ -370,7 +371,8 @@ export default function LiveDetailPage() {
       <div className="flex items-center gap-1 border-b border-gray-800">
         {(
           [
-            ['chart', '图表'],
+            ['equity', '权益曲线'],
+            ['aiNames', strategyName ?? 'AI 名称'],
             ['positions', `当前持仓（${(detail.positions ?? []).length}）`],
             ['trades', '成交明细'],
             ['deviation', '执行偏差'],
@@ -393,7 +395,7 @@ export default function LiveDetailPage() {
         {live && tab === 'logs' && <span className="text-xs text-gray-600 ml-2">（5s 自动刷新）</span>}
       </div>
 
-      {tab === 'chart' && (
+      {tab === 'equity' && (
       <div className="card">
         <div className="card-header">
           <h3 className="text-sm font-medium text-gray-200">
@@ -404,71 +406,91 @@ export default function LiveDetailPage() {
             ）
           </h3>
         </div>
-        <div className="card-body grid grid-cols-1 lg:grid-cols-2 gap-5">
-          <div>
-            {equityPoints.length > 1 ? (
-              <EquityChart points={equityPoints} height={chartH} />
-            ) : (
-              <p className="text-sm text-gray-500 text-center py-8">暂无权益数据</p>
+        <div className="card-body">
+          {equityPoints.length > 1 ? (
+            <EquityChart points={equityPoints} height={chartH} />
+          ) : (
+            <p className="text-sm text-gray-500 text-center py-8">暂无权益数据</p>
+          )}
+        </div>
+      </div>
+      )}
+
+      {tab === 'aiNames' && (
+      <div className="card">
+        <div className="card-header">
+          <div className="flex items-center gap-3">
+            <h3 className="text-sm font-medium text-gray-200">
+              价格网格 · {detail.symbol}
+              {anchor != null && stepPrice > 0 && (
+                <span className="text-gray-500 font-normal ml-2">
+                  锚定 {anchor.toFixed(priceDigits)} · 间距 {money(stepPrice, priceDigits)} ×{' '}
+                  {maxLevels} 格
+                </span>
+              )}
+            </h3>
+            <span className="text-2xs text-gray-500">
+              AI 策略：
+              <span className="text-sky-300 font-medium">{strategyName ?? '未命名'}</span>
+              {playbook?.label && <span className="text-gray-500"> · {playbook.label}</span>}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            {lastFill && (
+              <span
+                className={`text-xs font-mono ${
+                  lastFill.side === 'buy' ? 'text-profit' : 'text-loss'
+                }`}
+              >
+                最近成交 {lastFill.price.toFixed(priceDigits)}{' '}
+                {lastFill.side === 'buy' ? '买开' : '卖开'}
+              </span>
+            )}
+            {currentPrice != null && (
+              <span className="text-xs font-mono text-blue-300">
+                现价 {currentPrice.toFixed(priceDigits)}
+              </span>
+            )}
+            {anchor != null && (status === 'running' || status === 'paused') && (
+              <button
+                type="button"
+                className="text-xs px-2.5 py-1 rounded border border-gray-600 text-gray-300 hover:border-blue-500 hover:text-blue-300 disabled:opacity-50 transition-colors"
+                disabled={resetAnchor.isPending}
+                onClick={() => {
+                  if (runId) resetAnchor.mutate(runId);
+                }}
+                title="把网格锚定价重置为当前最新买价，网格线随之平移"
+              >
+                {resetAnchor.isPending ? (
+                  <Loader2 className="w-3 h-3 animate-spin inline mr-1" />
+                ) : (
+                  <RotateCcw className="w-3 h-3 inline mr-1" />
+                )}
+                重置锚点
+              </button>
             )}
           </div>
-          <div className="lg:border-l lg:border-gray-800 lg:pl-5">
-            <div className="flex items-center justify-between mb-2">
-              <h4 className="text-xs font-medium text-gray-300">
-                价格网格 · {detail.symbol}
-                {anchor != null && stepPrice > 0 && (
-                  <span className="text-gray-500 font-normal ml-2">
-                    锚定 {anchor.toFixed(priceDigits)} · 间距 {money(stepPrice, priceDigits)} ×{' '}
-                    {maxLevels} 格
-                  </span>
-                )}
-              </h4>
-              {lastFill && (
-                <span
-                  className={`text-xs font-mono ${
-                    lastFill.side === 'buy' ? 'text-profit' : 'text-loss'
-                  }`}
-                >
-                  最近成交 {lastFill.price.toFixed(priceDigits)}{' '}
-                  {lastFill.side === 'buy' ? '买开' : '卖开'}
-                </span>
-              )}
-              {currentPrice != null && (
-                <span className="text-xs font-mono text-blue-300">
-                  现价 {currentPrice.toFixed(priceDigits)}
-                </span>
-              )}
-              {anchor != null && (status === 'running' || status === 'paused') && (
-                <button
-                  type="button"
-                  className="text-xs px-2.5 py-1 rounded border border-gray-600 text-gray-300 hover:border-blue-500 hover:text-blue-300 disabled:opacity-50 transition-colors"
-                  disabled={resetAnchor.isPending}
-                  onClick={() => {
-                    if (runId) resetAnchor.mutate(runId);
-                  }}
-                  title="把网格锚定价重置为当前最新买价，网格线随之平移"
-                >
-                  {resetAnchor.isPending ? (
-                    <Loader2 className="w-3 h-3 animate-spin inline mr-1" />
-                  ) : (
-                    <RotateCcw className="w-3 h-3 inline mr-1" />
-                  )}
-                  重置锚点
-                </button>
-              )}
-            </div>
-            <PriceLadderChart
-              height={chartH - 28}
-              digits={priceDigits}
-              currentPrice={currentPrice}
-              anchor={anchor}
-              stepPrice={stepPrice}
-              maxLevels={maxLevels}
-              openPrices={openPrices}
-              sellOpenPrices={sellOpenPrices}
-              history={priceHistory}
-            />
-          </div>
+        </div>
+        <div className="card-body space-y-4">
+          <PriceLadderChart
+            height={Math.max(320, chartH - 180)}
+            digits={priceDigits}
+            currentPrice={currentPrice}
+            anchor={anchor}
+            stepPrice={stepPrice}
+            maxLevels={maxLevels}
+            openPrices={openPrices}
+            sellOpenPrices={sellOpenPrices}
+            history={priceHistory}
+          />
+          <GridLevelTable
+            anchor={anchor}
+            stepPrice={stepPrice}
+            maxLevels={maxLevels}
+            openPrices={openPrices}
+            sellOpenPrices={sellOpenPrices}
+            digits={priceDigits}
+          />
         </div>
       </div>
       )}
