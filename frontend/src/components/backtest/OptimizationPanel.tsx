@@ -1,8 +1,10 @@
 import { Loader2, Play, Plus, Trash2 } from 'lucide-react';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAnalyses, useCreateOptimization } from '@/hooks/useBacktests';
+import { useStrategy } from '@/hooks/useStrategies';
 import { apiError } from '@/lib/api';
+import { resolveSchema, type ParamField } from '@/lib/strategyParams';
 import type {
   OptimizationObjective,
   OptimizationResult,
@@ -27,6 +29,8 @@ interface SpaceRow {
   values: string; // comma separated, parsed on submit
 }
 
+const EMPTY_PARAMS: Record<string, unknown> = {};
+
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Parse "1, 2.5, fast" → typed candidate values (numeric when possible). */
@@ -41,15 +45,117 @@ function parseValues(raw: string): (number | string)[] {
     });
 }
 
+/** Suggestion chip: one declared strategy parameter with ready-made candidates. */
+interface ParamSuggestion {
+  key: string;
+  label: string;
+  currentText: string;
+  candidates: string; // comma list, '' = not grid-searchable
+}
+
+function formatCandidate(n: number, type: ParamField['type'], step: number): string {
+  if (type === 'int') return String(Math.round(n));
+  const decimals = Math.max(1, (String(step).split('.')[1] ?? '').length);
+  const snapped = Math.round(n / step) * step;
+  return snapped.toFixed(decimals).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+/**
+ * Build a default candidate list around the frozen value: [v-step, v, v+step],
+ * widened to ±2 steps when min/max clipping leaves fewer than 2 distinct values.
+ * bool/enum return all options; free text is not grid-searchable.
+ */
+function buildCandidates(field: ParamField, current: unknown): string {
+  if (field.type === 'bool') return 'false, true';
+  if (field.type === 'enum') return (field.options ?? []).map((o) => o.value).join(', ');
+  const v = Number(current);
+  if (!Number.isFinite(v)) return '';
+  const step = field.step && field.step > 0 ? field.step : v !== 0 ? Math.abs(v) * 0.1 : 1;
+  const lo = field.min ?? -Infinity;
+  const hi = field.max ?? Infinity;
+  const clampFmt = (n: number) =>
+    formatCandidate(Math.min(hi, Math.max(lo, n)), field.type, step);
+  let values = [...new Set([v - step, v, v + step].map(clampFmt))];
+  if (values.length < 3) {
+    // Boundary value (e.g. v == min): widen to ±2 steps so both directions
+    // are explored where the bounds allow.
+    values = [...new Set([v - 2 * step, v - step, v, v + step, v + 2 * step].map(clampFmt))];
+  }
+  return values.join(', ');
+}
+
+function formatCurrent(v: unknown): string {
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (v == null) return '—';
+  return String(v);
+}
+
+/**
+ * Derive the clickable default-parameter list from the task's frozen parameters
+ * (full set when created via the structured form), falling back to the strategy's
+ * saved params. Known template families get labels/bounds/steps via resolveSchema;
+ * unknown numeric/bool keys still produce usable suggestions.
+ */
+function buildSuggestions(defaults: Record<string, unknown>): ParamSuggestion[] {
+  const keys = Object.keys(defaults);
+  if (keys.length === 0) return [];
+  const known = new Map<string, ParamField>();
+  for (const group of resolveSchema(keys) ?? []) {
+    for (const f of group.fields) known.set(f.key, f);
+  }
+  const out: ParamSuggestion[] = [];
+  for (const key of keys) {
+    let field = known.get(key);
+    if (!field) {
+      const v = defaults[key];
+      if (typeof v === 'boolean') {
+        field = { key, label: key, type: 'bool', default: v };
+      } else if (typeof v === 'number' && Number.isFinite(v)) {
+        field = {
+          key,
+          label: key,
+          type: Number.isInteger(v) ? 'int' : 'float',
+          default: v,
+          step: v !== 0 ? Math.abs(v) * 0.1 : 1,
+        };
+      }
+    }
+    if (!field || field.type === 'text') continue;
+    const current = defaults[key] ?? field.default;
+    const candidates = buildCandidates(field, current);
+    // Need ≥2 distinct candidates for a grid search (e.g. min==max edge case).
+    if (candidates.split(', ').length < 2) continue;
+    out.push({ key, label: field.label, currentText: formatCurrent(current), candidates });
+  }
+  return out;
+}
+
 function ParamSpaceEditor({
   rows,
   onChange,
+  suggestions,
 }: {
   rows: SpaceRow[];
   onChange: (rows: SpaceRow[]) => void;
+  suggestions: ParamSuggestion[];
 }) {
   const update = (i: number, patch: Partial<SpaceRow>) =>
     onChange(rows.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+
+  // Click a default-param chip: fill the first blank row, otherwise append.
+  const pick = (s: ParamSuggestion) => {
+    if (rows.some((r) => r.name.trim() === s.key) || rows.length >= 4) return;
+    const blankIdx = rows.findIndex((r) => !r.name.trim() && !r.values.trim());
+    if (blankIdx >= 0) {
+      onChange(rows.map((r, i) => (i === blankIdx ? { name: s.key, values: s.candidates } : r)));
+    } else {
+      onChange([...rows, { name: s.key, values: s.candidates }]);
+    }
+  };
+
+  const addedKeys = new Set(rows.map((r) => r.name.trim()).filter(Boolean));
+  const roomLeft = rows.length < 4;
+
   return (
     <div className="space-y-2">
       {rows.map((row, i) => (
@@ -57,6 +163,7 @@ function ParamSpaceEditor({
           <input
             className="input w-40 font-mono"
             placeholder="参数名（如 fast_ma）"
+            list="optim-param-keys"
             value={row.name}
             onChange={(e) => update(i, { name: e.target.value })}
           />
@@ -77,6 +184,49 @@ function ParamSpaceEditor({
           </button>
         </div>
       ))}
+      <datalist id="optim-param-keys">
+        {suggestions.map((s) => (
+          <option key={s.key} value={s.key}>
+            {s.label}（当前 {s.currentText}）
+          </option>
+        ))}
+      </datalist>
+      {suggestions.length > 0 && (
+        <div className="space-y-1 pt-0.5">
+          <p className="text-[11px] text-gray-500">
+            策略默认参数（点击添加，候选值已按当前值与步长自动生成；最多 4 个参数）
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {suggestions.map((s) => {
+              const added = addedKeys.has(s.key);
+              const disabled = added || !roomLeft;
+              return (
+                <button
+                  key={s.key}
+                  type="button"
+                  disabled={disabled}
+                  title={
+                    added
+                      ? `${s.key} 已添加`
+                      : `${s.key}（${s.label}）当前 = ${s.currentText}；候选：${s.candidates}`
+                  }
+                  onClick={() => pick(s)}
+                  className={`px-2 py-0.5 rounded border text-[11px] font-mono transition-colors ${
+                    added
+                      ? 'border-profit/40 bg-profit/10 text-profit cursor-default'
+                      : 'border-gray-600 bg-surface-700 text-gray-300 hover:border-blue-400 hover:text-blue-300'
+                  } disabled:opacity-70`}
+                >
+                  {s.key}
+                  <span className={added ? 'text-profit/70 ml-1' : 'text-gray-500 ml-1'}>
+                    {added ? '✓' : s.currentText}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {rows.length < 4 && (
         <button
           type="button"
@@ -154,14 +304,33 @@ function ResultTable({ result }: { result: OptimizationResult }) {
   );
 }
 
-export default function OptimizationPanel({ taskId }: { taskId: string }) {
+export default function OptimizationPanel({
+  taskId,
+  paramSeed,
+  strategyId,
+}: {
+  taskId: string;
+  /** Frozen parameters of this task (full declared set when form-created). */
+  paramSeed?: Record<string, unknown> | null;
+  /** Used to fall back to the strategy's saved params when the task omits keys. */
+  strategyId?: string;
+}) {
   const q = useAnalyses(taskId, true);
   const analyses = q.data?.items ?? [];
   const create = useCreateOptimization(taskId);
+  const seedEmpty = !paramSeed || Object.keys(paramSeed).length === 0;
+  // Only fetch the strategy when the task carries no frozen parameter keys.
+  const strategyQ = useStrategy(seedEmpty ? strategyId : undefined);
   const [rows, setRows] = useState<SpaceRow[]>([{ name: '', values: '' }]);
   const [method, setMethod] = useState<'grid' | 'random'>('grid');
   const [samples, setSamples] = useState(20);
   const [objective, setObjective] = useState<OptimizationObjective>('sharpe_ratio');
+
+  // Prefer the task's frozen values; fall back to the strategy's saved defaults.
+  const defaults = seedEmpty
+    ? (strategyQ.data?.parameters ?? EMPTY_PARAMS)
+    : (paramSeed as Record<string, unknown>);
+  const suggestions = useMemo(() => buildSuggestions(defaults), [defaults]);
 
   const latest = analyses.find((a) => a.kind === 'optimization');
   const res = (latest?.result ?? null) as OptimizationResult | null;
@@ -196,7 +365,7 @@ export default function OptimizationPanel({ taskId }: { taskId: string }) {
         <span className="text-xs text-gray-500">网格 / 随机搜索，按目标指标排名（每个组合一个子回测）</span>
       </div>
       <div className="card-body space-y-3">
-        <ParamSpaceEditor rows={rows} onChange={setRows} />
+        <ParamSpaceEditor rows={rows} onChange={setRows} suggestions={suggestions} />
         <div className="flex flex-wrap items-end gap-2 text-sm">
           <label className="flex flex-col gap-1">
             <span className="text-xs text-gray-500">搜索方式</span>

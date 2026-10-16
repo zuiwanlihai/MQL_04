@@ -378,7 +378,11 @@ export default function BacktestReportPage() {
             )}
 
             {activeSafe === 'optimization' && task.status === 'completed' && (
-              <OptimizationPanel taskId={task.id} />
+              <OptimizationPanel
+                taskId={task.id}
+                paramSeed={task.parameters}
+                strategyId={task.strategy_id}
+              />
             )}
 
             {activeSafe === 'sensitivity' && task.group_id && (
