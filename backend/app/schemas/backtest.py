@@ -149,6 +149,24 @@ class EquityPoint(BaseModel):
     baseline: float
 
 
+class StrategyScoreOut(BaseModel):
+    """策略综合评分（镜像 sandbox.metrics.strategy_score 输出与前端 StrategyScore 类型）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    score: float = Field(ge=0, le=100, description="加权总分 × 可信度系数，0-100。")
+    grade: Literal["S", "A", "B", "C", "D", "F"]
+    grade_label: str
+    credibility: float = Field(ge=0, le=1)
+    credibility_note: str
+    dimensions: dict[str, float] = Field(
+        default_factory=dict,
+        description="收益能力/风险调整/回撤控制/交易质量 四维得分（0-100）。",
+    )
+    highlights: list[str] = Field(default_factory=list)
+    shortcomings: list[str] = Field(default_factory=list)
+
+
 class BacktestReportOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -178,6 +196,7 @@ class BacktestReportOut(BaseModel):
     total_swap: float
     equity_curve: list[dict]
     monthly_returns: dict[str, float]
+    score: StrategyScoreOut | None = None
     generated_at: datetime
 
 

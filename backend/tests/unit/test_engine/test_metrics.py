@@ -127,3 +127,95 @@ def test_annual_volatility_positive():
     mean = sum(rets) / len(rets)
     std = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1))
     assert v == std * math.sqrt(metrics.bars_per_year("H1")) * 100.0
+
+
+# ───────────────────────── strategy_score ─────────────────────────
+
+_SCORE_KEYS = {
+    "score", "grade", "grade_label", "credibility",
+    "credibility_note", "dimensions", "highlights", "shortcomings",
+}
+_DIMENSIONS = {"收益能力", "风险调整", "回撤控制", "交易质量"}
+
+
+def _report(**overrides) -> dict:
+    base = {
+        "annual_return_percent": 0.0,
+        "total_return_percent": 0.0,
+        "sharpe_ratio": 0.0,
+        "sortino_ratio": 0.0,
+        "calmar_ratio": 0.0,
+        "max_drawdown_percent": 0.0,
+        "recovery_factor": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "expectancy": 0.0,
+        "total_trades": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_score_zero_trades_is_f_with_zero_credibility():
+    s = metrics.strategy_score(_report(total_trades=0))
+    assert s["score"] == 0.0
+    assert s["grade"] == "F"
+    assert s["credibility"] == 0.0
+    assert s["dimensions"] == {}
+    assert s["highlights"] == []
+    assert any("未触发" in x or "未被验证" in x for x in s["shortcomings"])
+
+
+def test_score_structure_and_strong_strategy_is_top_grade():
+    s = metrics.strategy_score(_report(
+        annual_return_percent=60, total_return_percent=150,
+        sharpe_ratio=2.5, sortino_ratio=3.0, calmar_ratio=3.0,
+        max_drawdown_percent=5, recovery_factor=3.0,
+        win_rate=0.55, profit_factor=2.5, expectancy=8, total_trades=200,
+    ))
+    assert set(s.keys()) == _SCORE_KEYS
+    assert set(s["dimensions"].keys()) == _DIMENSIONS
+    assert all(0 <= v <= 100 for v in s["dimensions"].values())
+    # 样本充足 → 可信度满分，强策略应落在 S/A
+    assert s["credibility"] == 1.0
+    assert s["score"] >= 70
+    assert s["grade"] in {"S", "A"}
+
+
+def test_score_weak_strategy_is_f_and_flags_risks():
+    s = metrics.strategy_score(_report(
+        annual_return_percent=-30, total_return_percent=-40,
+        sharpe_ratio=-1.0, sortino_ratio=-1.0, calmar_ratio=0.0,
+        max_drawdown_percent=60, recovery_factor=-1.0,
+        win_rate=0.2, profit_factor=0.5, expectancy=-6, total_trades=100,
+    ))
+    assert s["grade"] == "F"
+    assert s["score"] < 25
+    joined = " ".join(s["shortcomings"])
+    assert "年化收益" in joined and "回撤" in joined and "夏普" in joined
+
+
+def test_score_credibility_tiers_by_sample_size():
+    assert metrics.strategy_score(_report(total_trades=5))["credibility"] == 0.5
+    assert metrics.strategy_score(_report(total_trades=20))["credibility"] == 0.75
+    assert metrics.strategy_score(_report(total_trades=40))["credibility"] == 0.9
+    assert metrics.strategy_score(_report(total_trades=120))["credibility"] == 1.0
+
+
+def test_score_final_is_bounded_and_credibility_scales_raw():
+    # 中等指标但样本极少：最终分 = 原始分 × 0.5
+    s_small = metrics.strategy_score(_report(
+        annual_return_percent=15, total_return_percent=40,
+        sharpe_ratio=1.2, sortino_ratio=1.2, calmar_ratio=1.0,
+        max_drawdown_percent=12, recovery_factor=1.2,
+        win_rate=0.5, profit_factor=1.5, expectancy=2, total_trades=8,
+    ))
+    assert 0 <= s_small["score"] <= 100
+    s_full = metrics.strategy_score(_report(
+        annual_return_percent=15, total_return_percent=40,
+        sharpe_ratio=1.2, sortino_ratio=1.2, calmar_ratio=1.0,
+        max_drawdown_percent=12, recovery_factor=1.2,
+        win_rate=0.5, profit_factor=1.5, expectancy=2, total_trades=200,
+    ))
+    # 指标完全相同，仅可信度不同 → 大样本分数严格更高
+    assert s_full["score"] > s_small["score"]

@@ -611,6 +611,7 @@ class BacktestQueue:
                 total_swap=_dec(r.get("total_swap", 0.0), 4),
                 equity_curve=state.equity_curve,
                 monthly_returns=dict(r.get("monthly_returns") or {}),
+                score=r.get("score"),
             ))
             snap = dict(task.config_snapshot or {})
             snap["n_bars"] = int(r.get("n_bars", 0))

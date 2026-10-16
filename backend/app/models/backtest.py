@@ -267,6 +267,11 @@ class BacktestReport(BaseModel, kw_only=True):
         JSONB, nullable=False, default_factory=dict,
         comment='{"2025-03": 4.12, …} percent per UTC month.',
     )
+    score: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, default=None,
+        comment="策略综合评分：{score,grade(S-F),credibility,dimensions,highlights,shortcomings}；"
+        "NULL = 该报告生成时评分逻辑尚未上线，需重跑回测。",
+    )
     generated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default_factory=lambda: datetime.now(UTC),

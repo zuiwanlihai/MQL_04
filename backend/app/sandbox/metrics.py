@@ -326,7 +326,7 @@ def strategy_score(report: dict) -> dict:
         ("样本量", n_tr, f"{trades} 笔"),
     ]
     sorted_metrics = sorted(metric_labels, key=lambda x: x[1])
-    shortcomings = [f"{label} {val}（{raw}）" for label, raw, val in sorted_metrics[:2] if raw < 50]
+    shortcomings = [f"{label} {val}（{round(raw, 1)} 分）" for label, raw, val in sorted_metrics[:2] if raw < 50]
     highlights = [f"{label} {val}" for label, raw, val in reversed(sorted_metrics[-2:]) if raw >= 70]
 
     if ann_ret < -10:
